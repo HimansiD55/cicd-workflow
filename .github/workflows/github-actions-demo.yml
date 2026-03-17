@@ -1,4 +1,4 @@
-name: Print Message on Push to Main
+name: Print Message on Push to newb
 
 on:
   push:
@@ -6,10 +6,14 @@ on:
       -  "newb/*"
 
 jobs:
-  print-message-job:
+  new-branch:
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Print a message to the console
-        run: echo "Hello GitHub Actions from newb"
+    steps: 
+      - name: checkout code
+        uses: action/checkout@v3
+
+      -  name: run tests
+         run: echo "running test from newb branch "
+         
 
