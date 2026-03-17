@@ -3,7 +3,7 @@ name: Print Message on Push to Main
 on:
   push:
     branches:
-      - "newb/*"
+      - "feature/*"
 
 jobs:
   print-message-job:
