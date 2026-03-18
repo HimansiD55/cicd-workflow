@@ -1,4 +1,4 @@
-name: Print Message on Push to Main
+name: CI-CD Pipeline
 
 on:
   push:
@@ -6,10 +6,39 @@ on:
       - main
 
 jobs:
-  print-message-job:
+
+  # 🔹 BUILD JOB (GitHub Hosted)
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Print a message to the console
-        run: echo "Hello GitHub Actions"
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build App
+        run: npm run build
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-files
+          path: build/
+
+  # 🔹 DEPLOY JOB (Self Hosted - EC2)
+  deploy:
+    needs: build   # 👈 important (runs after build)
+    runs-on: self-hosted
+
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-files
+
+      - name: Deploy to EC2
+        run: |
+          echo "Deploying..."
+          cp -r build/* /home/ubuntu/app/
