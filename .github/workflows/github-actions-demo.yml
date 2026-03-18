@@ -6,11 +6,9 @@ on:
       - main
 
 jobs:
-
-  # 🔹 BUILD JOB
+  # BUILD JOB - runs on GitLab shared runner
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -27,13 +25,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-files
-          path: build
+          path: build          # uploads CONTENTS of build/
 
-  # 🔹 DEPLOY JOB
+  # DEPLOY JOB - runs on your EC2 server
   deploy:
     needs: build
     runs-on: self-hosted
-
     steps:
       - name: Download Artifact
         uses: actions/download-artifact@v4
@@ -41,9 +38,11 @@ jobs:
           name: build-files
 
       - name: Check Files
-        run: ls -R
+        run: ls -R             # will show app.js at root
 
       - name: Deploy
         run: |
           mkdir -p /home/ubuntu/app
-          cp -r build/* /home/ubuntu/app/
+          cp -r * /home/ubuntu/app/    # ← FIXED: copy from root not build/
+          echo "Deploy done!"
+          ls /home/ubuntu/app          # verify files are there
