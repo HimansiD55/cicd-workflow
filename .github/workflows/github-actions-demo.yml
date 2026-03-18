@@ -7,6 +7,7 @@ on:
 
 jobs:
 
+  # 🔹 BUILD JOB (GitHub Hosted Runner)
   build:
     runs-on: ubuntu-latest
 
@@ -14,7 +15,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Node
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 18
@@ -22,32 +23,45 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
-      - name: Build
+      - name: Build App
         run: |
-          mkdir build
+          mkdir -p build
           cp app.js build/
 
-      - name: Upload Artifact
+      - name: Verify Build Files
+        run: ls -R
+
+      - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-build
+          name: build-files
           path: build/
 
+  # 🔹 DEPLOY JOB (Self-Hosted Runner - EC2)
   deploy:
     needs: build
     runs-on: self-hosted
 
     steps:
-      - name: Download Artifact
+      - name: Download Build Artifact
         uses: actions/download-artifact@v4
         with:
-          name: app-build
+          name: build-files
+
+      - name: Verify Downloaded Files
+        run: ls -R
 
       - name: Deploy to EC2
         run: |
           mkdir -p /home/ubuntu/app
           cp -r build/* /home/ubuntu/app/
           cd /home/ubuntu/app
-          npm install
+
+          # Install dependencies (if any)
+          npm install || true
+
+          # Stop old app if running
           pm2 stop app || true
-          pm2 start app.js
+
+          # Start app
+          pm2 start app.js || pm2 start app.js --name app
