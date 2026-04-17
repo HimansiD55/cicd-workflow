@@ -13,7 +13,18 @@ pipeline {
         disableConcurrentBuilds()
         skipDefaultCheckout(true)   // We do a manual checkout to get PR metadata
     }
-
+  // Guard: only run this pipeline for PR builds
+  stage('Validate PR Context') {
+    steps {
+        script {
+            if (!env.CHANGE_ID) {
+                echo "This is not a PR build (branch: ${env.BRANCH_NAME}). Skipping."
+                currentBuild.result = 'NOT_BUILT'
+                error("Skipping non-PR build")
+             }
+         }
+     }
+  }
     // ── Trigger: GitHub webhook fires on pull_request events ──────────────────
     triggers {
         githubPullRequests(
