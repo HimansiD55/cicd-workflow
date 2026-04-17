@@ -1,48 +1,39 @@
-name: CI-CD Pipeline
+name: CI-CD Build and Deploy
 
 on:
   push:
     branches:
-      - main
+      - main  # This only runs AFTER you merge the PR
 
 jobs:
-  # BUILD JOB - runs on GitLab shared runner
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Create Build Folder
+      - name: Create Build Artifact
         run: |
           mkdir -p build
           cp app.js build/
-
-      - name: Verify Build
-        run: ls -R
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-files
-          path: build          # uploads CONTENTS of build/
+          path: build
 
-  # DEPLOY JOB - runs on your EC2 server
   deploy:
     needs: build
-    runs-on: self-hosted
+    runs-on: self-hosted  # Your EC2 GitHub Runner
     steps:
       - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
           name: build-files
 
-      - name: Check Files
-        run: ls -R             # will show app.js at root
-
-      - name: Deploy
+      - name: Deploy to App Folder
         run: |
-          mkdir -p /home/ubuntu/app
-          cp -r * /home/ubuntu/app/    # ← FIXED: copy from root not build/
-          echo "Deploy done!"
-          ls /home/ubuntu/app          # verify files are there
+          sudo mkdir -p /home/ubuntu/app
+          sudo cp -r * /home/ubuntu/app/
+          echo "Deployment successful to EC2!"
