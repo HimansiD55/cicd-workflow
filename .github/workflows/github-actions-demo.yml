@@ -1,39 +1,25 @@
-name: CI-CD Build and Deploy
+name: CI-CD Pipeline
 
 on:
   push:
     branches:
-      - main  # This only runs AFTER you merge the PR
+      - main
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build-and-archive:
+    runs-on: ubuntu-latest  # Runs on GitHub's cloud, not your EC2
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Create Build Artifact
+      - name: Create Package
         run: |
-          mkdir -p build
-          cp app.js build/
+          mkdir -p deployment_package
+          cp app.js deployment_package/
+          echo "Build Version: ${GITHUB_SHA}" > deployment_package/version.txt
 
-      - name: Upload Artifact
+      - name: Save to GitHub Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: build-files
-          path: build
-
-  deploy:
-    needs: build
-    runs-on: self-hosted  # Your EC2 GitHub Runner
-    steps:
-      - name: Download Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: build-files
-
-      - name: Deploy to App Folder
-        run: |
-          sudo mkdir -p /home/ubuntu/app
-          sudo cp -r * /home/ubuntu/app/
-          echo "Deployment successful to EC2!"
+          name: approved-code-package
+          path: deployment_package/
