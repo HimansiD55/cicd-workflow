@@ -240,7 +240,7 @@ Be specific and actionable. Do not hallucinate line numbers — only include the
                         .replace('\t', '\\t')
 
                     writeFile file: '/tmp/claude_request.json', text: """{
-  "model": "claude-4-7-opus-latest",
+  "model": "claude-sonnet-4-5",
   "max_tokens": 4096,
   "messages": [
     {
