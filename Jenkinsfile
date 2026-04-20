@@ -189,7 +189,6 @@ Return ONLY valid JSON:
                                 --permission-mode acceptEdits \
                                 --allowedTools "Bash Read Edit Write" \
                                 --output-format json \
-                                --max-tokens 4096 \
                                 > /tmp/review.json
                         '''
                     }
