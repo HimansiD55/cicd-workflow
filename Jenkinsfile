@@ -55,31 +55,27 @@ pipeline {
             steps {
                 script {
                     def diffText = readFile('pr_diff.txt')
-                    // Explicitly tell Claude NOT to use markdown fences
-                    writeFile file: 'prompt.txt', text: "Perform a code review. Return ONLY a raw JSON object. Do NOT use markdown code blocks or backticks. Schema: { \"summary\": \"\", \"verdict\": \"PASS/FAIL\", \"critical_issues\": [], \"warnings\": [] }. \n\n ${diffText}"
+                    writeFile file: 'prompt.txt', text: "Review this code. Return ONLY JSON. Schema: { \"summary\": \"\", \"verdict\": \"PASS/FAIL\", \"critical_issues\": [], \"warnings\": [] }. \n\n ${diffText}"
 
                     withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CL_KEY')]) {
                         sh '''
                             export ANTHROPIC_API_KEY=$CL_KEY
-                            
-                            # 1. Get the result
-                            # 2. Extract the .result field
-                            # 3. Strip any accidental markdown fences (```json or ```)
-                            claude -p "$(cat prompt.txt)" --output-format json | \
-                            jq -r '.result' | \
-                            sed 's/^```json//g' | sed 's/^```//g' | sed 's/```$//g' > clean_review.json
+                            # Run Claude, peel the envelope, and save to review_result.json
+                            claude -p "$(cat prompt.txt)" --output-format json | jq -r '.result' > review_result.json
                         '''
                     }
                     
-                    // Verify the file isn't empty before running jq again
-                    def cleanReview = readFile('clean_review.json').trim()
-                    if (cleanReview) {
-                        env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' clean_review.json", returnStdout: true).trim()
-                    } else {
-                        env.REVIEW_VERDICT = "UNKNOWN"
-                    }
+                    // Read the file we just created
+                    def rawJson = readFile('review_result.json').trim()
                     
-                    echo "Verdict captured: ${env.REVIEW_VERDICT}"
+                    // Clean up any extra markdown backticks if Claude added them
+                    def cleanJson = rawJson.replaceAll("```json", "").replaceAll("```", "").trim()
+                    
+                    // Overwrite the file with the clean version so the next stage finds it
+                    writeFile file: 'review_result.json', text: cleanJson
+                    
+                    // Get the verdict for the GitHub Status
+                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' review_result.json", returnStdout: true).trim()
                 }
             }
         }
@@ -87,29 +83,20 @@ pipeline {
         stage('Post to GitHub') {
             steps {
                 script {
-                    // 1. Read and parse the JSON file
-                    def jsonText = readFile('final_review.json').trim()
+                    // This now looks for 'review_result.json', which we know exists
+                    def jsonText = readFile('review_result.json').trim()
                     def data = new groovy.json.JsonSlurper().parseText(jsonText)
 
-                    // 2. Build a Clean Markdown Report
                     def emoji = (data.verdict == 'PASS') ? "✅" : "❌"
-                    def markdown = """
-## ${emoji} Claude AI Code Review: ${data.verdict}
-
-### 📝 Summary
-${data.summary}
-
-### ⚠️ Issues Found
-"""
-                    // Add critical issues to the report
-                    data.critical_issues.each { issue ->
-                        markdown += "- **[CRITICAL]** ${issue.file}: ${issue.issue}\n"
-                        markdown += "  *Fix:* ${issue.recommendation}\n\n"
+                    def markdown = "## ${emoji} Claude AI Code Review: ${data.verdict}\n\n### 📝 Summary\n${data.summary}\n\n"
+                    
+                    if (data.critical_issues) {
+                        markdown += "### ⚠️ Critical Issues\n"
+                        data.critical_issues.each { issue ->
+                            markdown += "- **${issue.category}**: ${issue.issue} (File: ${issue.file})\n"
+                        }
                     }
 
-                    markdown += "\n--- \n*Sent from Jenkins via Claude AI*"
-
-                    // 3. Post the Clean Markdown
                     def payload = groovy.json.JsonOutput.toJson([body: markdown])
                     writeFile file: 'github_payload.json', text: payload
 
