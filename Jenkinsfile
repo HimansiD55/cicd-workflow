@@ -145,9 +145,8 @@ ${prMeta}
 ${changedFiles}
 
 ## Code Diff
-\`\`\`diff
+```diff
 ${diff}
-\`\`\`
 
 ## Review Instructions
 
