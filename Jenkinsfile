@@ -8,6 +8,7 @@ pipeline {
     }
 
     environment {
+        // These are used for global access
         GITHUB_TOKEN   = credentials('github-token')
         CLAUDE_API_KEY = credentials('ANTHROPIC_API_KEY')
     }
@@ -23,9 +24,16 @@ pipeline {
 
                     def gitUrl = env.GIT_URL ?: scm.userRemoteConfigs[0].url ?: ''
                     def repoSegments = gitUrl.tokenize('/')
-                    env.REPO_OWNER = repoSegments[-2]
-                    env.REPO_NAME  = repoSegments[-1].replace('.git', '')
-                    env.REPO_PATH  = "${env.REPO_OWNER}/${env.REPO_NAME}"
+                    
+                    // FIXED: Added safety check to prevent crash
+                    if (repoSegments.size() >= 2) {
+                        env.REPO_OWNER = repoSegments[-2]
+                        env.REPO_NAME  = repoSegments[-1].replace('.git', '')
+                        env.REPO_PATH  = "${env.REPO_OWNER}/${env.REPO_NAME}"
+                    } else {
+                        error("Could not parse repository owner and name from URL: ${gitUrl}")
+                    }
+                    
                     env.PR_NUMBER  = env.CHANGE_ID
                     env.BASE_BRANCH = env.CHANGE_TARGET ?: 'main'
                 }
@@ -51,31 +59,30 @@ pipeline {
             }
         }
 
-       stage('Claude Review') {
+        stage('Claude Review') {
             steps {
                 script {
                     def diffText = readFile('pr_diff.txt')
-                    writeFile file: 'prompt.txt', text: "Review this code. Return ONLY JSON with: summary, verdict (PASS/FAIL), critical_issues (list of strings). \n\n ${diffText}"
+                    writeFile file: 'prompt.txt', text: "Review this code. Return ONLY JSON with fields: summary, verdict (PASS/FAIL). \n\n ${diffText}"
 
                     withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CL_KEY')]) {
                         sh '''
                             export ANTHROPIC_API_KEY=$CL_KEY
-                            # Run Claude and use jq to clean the output into a single file
-                            claude -p "$(cat prompt.txt)" --output-format json | jq -r '.result' > review.json
+                            # Use jq to peel the envelope and handle markdown fences automatically
+                            claude -p "$(cat prompt.txt)" --output-format json | jq -r '.result' | sed 's/```json//g' | sed 's/```//g' > review.json
                         '''
                     }
-                    // Simple check to see if we should mark it as fail
-                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict' review.json", returnStdout: true).trim()
+                    // Extract verdict for the post-build status
+                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' review.json", returnStdout: true).trim()
                 }
             }
         }
 
-       stage('Post to GitHub') {
+        stage('Post to GitHub') {
             steps {
                 withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
                     sh '''
-                        # USE JQ TO BUILD THE GITHUB COMMENT DIRECTLY IN THE SHELL
-                        # This creates a clean "body" for the GitHub API
+                        # Build the JSON payload using JQ (Safe and Easy)
                         jq -n --slurpfile r review.json \
                         '{body: ("## Claude AI Review: " + $r[0].verdict + "\n\n### Summary\n" + $r[0].summary)}' > payload.json
 
@@ -93,13 +100,13 @@ pipeline {
     post {
         always {
             script {
-                // Ensure variables exist before calling curl
                 if (env.REPO_PATH && env.PR_HEAD_SHA) {
+                    // This creates the Red/Green status in your PR console
                     def state = (env.REVIEW_VERDICT == 'PASS') ? 'success' : 'failure'
                     withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
                         sh """
                             curl -sf -X POST -H "Authorization: token \$TKN" \
-                            -d '{"state":"${state}","context":"claude-ai-review"}' \
+                            -d '{"state":"${state}","context":"claude-ai-review","description":"Review Verdict: ${env.REVIEW_VERDICT}"}' \
                             "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" || true
                         """
                     }
