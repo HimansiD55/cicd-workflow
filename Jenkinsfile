@@ -55,19 +55,31 @@ pipeline {
             steps {
                 script {
                     def diffText = readFile('pr_diff.txt')
-                    // I added a better prompt so Claude knows exactly what to do
-                    writeFile file: 'prompt.txt', text: "Perform a senior dev code review. Return ONLY JSON with fields: summary, verdict (PASS/FAIL), critical_issues[], warnings[]. \n\n ${diffText}"
+                    // Explicitly tell Claude NOT to use markdown fences
+                    writeFile file: 'prompt.txt', text: "Perform a code review. Return ONLY a raw JSON object. Do NOT use markdown code blocks or backticks. Schema: { \"summary\": \"\", \"verdict\": \"PASS/FAIL\", \"critical_issues\": [], \"warnings\": [] }. \n\n ${diffText}"
 
                     withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CL_KEY')]) {
                         sh '''
                             export ANTHROPIC_API_KEY=$CL_KEY
-                            # Run Claude and immediately extract the 'result' field using jq
-                            claude -p "$(cat prompt.txt)" --output-format json | jq -r '.result' > clean_review.json
+                            
+                            # 1. Get the result
+                            # 2. Extract the .result field
+                            # 3. Strip any accidental markdown fences (```json or ```)
+                            claude -p "$(cat prompt.txt)" --output-format json | \
+                            jq -r '.result' | \
+                            sed 's/^```json//g' | sed 's/^```//g' | sed 's/```$//g' > clean_review.json
                         '''
                     }
-                    // Now read the CLEAN file
+                    
+                    // Verify the file isn't empty before running jq again
                     def cleanReview = readFile('clean_review.json').trim()
-                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' clean_review.json", returnStdout: true).trim()
+                    if (cleanReview) {
+                        env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' clean_review.json", returnStdout: true).trim()
+                    } else {
+                        env.REVIEW_VERDICT = "UNKNOWN"
+                    }
+                    
+                    echo "Verdict captured: ${env.REVIEW_VERDICT}"
                 }
             }
         }
