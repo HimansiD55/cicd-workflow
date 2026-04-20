@@ -7,13 +7,11 @@ pipeline {
     agent {
         label 'ec2-reviewer'
     }
-
     options {
         timeout(time: 15, unit: 'MINUTES')
         disableConcurrentBuilds()
         skipDefaultCheckout(true)
     }
-
     environment {
         GITHUB_TOKEN   = credentials('github-token')
         CLAUDE_API_KEY = credentials('ANTHROPIC_API_KEY')
