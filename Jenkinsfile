@@ -55,16 +55,19 @@ pipeline {
             steps {
                 script {
                     def diffText = readFile('pr_diff.txt')
-                    writeFile file: 'prompt.txt', text: "Review this code and return ONLY JSON:\n${diffText}"
+                    // I added a better prompt so Claude knows exactly what to do
+                    writeFile file: 'prompt.txt', text: "Perform a senior dev code review. Return ONLY JSON with fields: summary, verdict (PASS/FAIL), critical_issues[], warnings[]. \n\n ${diffText}"
 
                     withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CL_KEY')]) {
                         sh '''
                             export ANTHROPIC_API_KEY=$CL_KEY
-                            claude -p "$(cat prompt.txt)" --output-format json > review.json
+                            # Run Claude and immediately extract the 'result' field using jq
+                            claude -p "$(cat prompt.txt)" --output-format json | jq -r '.result' > clean_review.json
                         '''
                     }
-                    def review = readFile('review.json').trim()
-                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' review.json", returnStdout: true).trim()
+                    // Now read the CLEAN file
+                    def cleanReview = readFile('clean_review.json').trim()
+                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' clean_review.json", returnStdout: true).trim()
                 }
             }
         }
@@ -72,8 +75,8 @@ pipeline {
         stage('Post to GitHub') {
             steps {
                 script {
-                    // PREPARE DATA OUTSIDE OF SH
-                    def reviewContent = readFile('review.json').trim()
+                    // Read the CLEANED review, not the raw CLI output
+                    def reviewContent = readFile('clean_review.json').trim()
                     def jsonPayload = groovy.json.JsonOutput.toJson([body: reviewContent])
                     writeFile file: 'payload.json', text: jsonPayload
 
@@ -81,6 +84,7 @@ pipeline {
                         sh '''
                             curl -sf -X POST \
                                  -H "Authorization: token $TKN" \
+                                 -H "Accept: application/vnd.github.v3+json" \
                                  -H "Content-Type: application/json" \
                                  "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
                                  -d @payload.json
