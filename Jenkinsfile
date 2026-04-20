@@ -108,7 +108,21 @@ pipeline {
                 }
             }
         }
+         def response = sh(
+                        script: """
+                            curl -s -X POST "https://api.anthropic.com/v1/messages" \\
+                                 -H "x-api-key: ${CLAUDE_API_KEY}" \\
+                                 -H "anthropic-version: 2023-06-01" \\
+                                 -H "content-type: application/json" \\
+                                 --data @/tmp/claude_request.json \\
+                                 --max-time 90 \\
+                                 -w "\\nHTTP_STATUS:%{http_code}"
+                        """,
+                        returnStdout: true
+                    ).trim()
 
+                    echo "API Response: ${response}"
+                    writeFile file: '/tmp/claude_response.json', text: response.split('HTTP_STATUS:')[0]
        stage('Claude AI Review') {
             steps {
                 script {
