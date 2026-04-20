@@ -130,8 +130,7 @@ pipeline {
                     def changedFiles = readFile('/tmp/pr_files.txt').trim()
                     def prMeta       = readFile('/tmp/pr_meta.json').trim()
 
-                    // Write prompt to a plain file — no Groovy string escaping needed
-                    def prompt = """You are a senior software engineer performing a thorough code review of a GitHub Pull Request.
+                    writeFile file: '/tmp/prompt.txt', text: """You are a senior software engineer performing a thorough code review of a GitHub Pull Request.
 
 ## PR Metadata
 ${prMeta}
@@ -173,9 +172,6 @@ verdict must be PASS, WARN, or FAIL.
 FAIL = any critical issue. WARN = warnings but no blockers. PASS = only suggestions or positives.
 Each issue object must have: category, file, line (use ? if unknown), issue, recommendation"""
 
-                    // Use Python to safely build the JSON — avoids ALL escaping issues
-                    writeFile file: '/tmp/prompt.txt', text: prompt
-
                     sh '''
 python3 - <<'PYEOF'
 import json
@@ -186,9 +182,7 @@ with open('/tmp/prompt.txt', 'r') as f:
 payload = {
     "model": "claude-sonnet-4-5",
     "max_tokens": 4096,
-    "messages": [
-        {"role": "user", "content": prompt_text}
-    ]
+    "messages": [{"role": "user", "content": prompt_text}]
 }
 
 with open('/tmp/claude_request.json', 'w') as f:
@@ -198,32 +192,34 @@ print("Request JSON written successfully")
 PYEOF
 '''
 
-                    def response = sh(
-                        script: """
-                            curl -sf -X POST "https://api.anthropic.com/v1/messages" \\
-                                 -H "x-api-key: ${CLAUDE_API_KEY}" \\
-                                 -H "anthropic-version: 2023-06-01" \\
-                                 -H "content-type: application/json" \\
-                                 --data @/tmp/claude_request.json \\
-                                 --max-time 90
-                        """,
-                        returnStdout: true
-                    ).trim()
+                    // Use withCredentials to safely inject the key into shell env
+                    withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CLAUDE_KEY')]) {
+                        sh '''
+                            HTTP_STATUS=$(curl -s -o /tmp/claude_response.json -w "%{http_code}" \
+                                -X POST "https://api.anthropic.com/v1/messages" \
+                                -H "x-api-key: ${CLAUDE_KEY}" \
+                                -H "anthropic-version: 2023-06-01" \
+                                -H "content-type: application/json" \
+                                --data @/tmp/claude_request.json \
+                                --max-time 90)
 
-                    writeFile file: '/tmp/claude_response.json', text: response
+                            echo "HTTP Status: ${HTTP_STATUS}"
+                            cat /tmp/claude_response.json
 
-                    // Validate we got a proper response before extracting
+                            if [ "$HTTP_STATUS" != "200" ]; then
+                                echo "ERROR: Anthropic API returned HTTP ${HTTP_STATUS}"
+                                exit 1
+                            fi
+                        '''
+                    }
+
                     def reviewJson = sh(
-                        script: """
-                            jq -r '.content[0].text // empty' /tmp/claude_response.json || echo ''
-                        """,
+                        script: "jq -r '.content[0].text // empty' /tmp/claude_response.json",
                         returnStdout: true
                     ).trim()
 
                     if (!reviewJson) {
-                        echo "Raw API response:"
-                        sh 'cat /tmp/claude_response.json'
-                        error("Claude API returned no content — check response above")
+                        error("Claude API returned no content")
                     }
 
                     writeFile file: '/tmp/review.json', text: reviewJson
@@ -233,6 +229,8 @@ PYEOF
                     env.REVIEW_VERDICT = readFile('/tmp/verdict.txt').trim()
                     echo "Verdict: ${env.REVIEW_VERDICT}"
                 }
+            }
+        }
             }
         }
 
