@@ -166,6 +166,7 @@ with open('/tmp/prompt.txt', 'r') as f:
 payload = {
     "model": "claude-sonnet-4-5",
     "max_tokens": 4096,
+    "system": "You are a code review assistant. Always respond with pure valid JSON only. Never use markdown code fences. Never add any text before or after the JSON object.",
     "messages": [{"role": "user", "content": prompt_text}]
 }
 
@@ -197,9 +198,29 @@ PYEOF
                     }
 
                     def reviewJson = sh(
-                        script: "jq -r '.content[0].text // empty' /tmp/claude_response.json",
-                        returnStdout: true
-                    ).trim()
+                        script: """
+                            jq -r '.content[0].text // empty' /tmp/claude_response.json \
+                            | sed 's/^```json//' \
+                            | sed 's/^```//' \
+                            | tr -d '\\r' \
+                            | awk 'NF' \
+                            > /tmp/review.json
+                            cat /tmp/review.json
+                        """,
+                        returnStdout: false
+                    )
+
+                    def reviewContent = readFile('/tmp/review.json').trim()
+
+                    if (!reviewContent) {
+                        error("Claude API returned no content")
+                    }
+
+                    echo "Claude review received (${reviewContent.size()} bytes)"
+
+                    sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
+                    env.REVIEW_VERDICT = readFile('/tmp/verdict.txt').trim()
+                    echo "Verdict: ${env.REVIEW_VERDICT}"
 
                     if (!reviewJson) {
                         error("Claude API returned no content")
@@ -220,11 +241,26 @@ PYEOF
                 script {
                     def commentBody = sh(
                         script: """
+sh '''
 python3 - <<'PYEOF'
 import json
 
-with open('/tmp/review.json') as f:
-    data = json.load(f)
+with open('/tmp/prompt.txt', 'r') as f:
+    prompt_text = f.read()
+
+payload = {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 4096,
+    "system": "You are a code review assistant. Always respond with pure valid JSON only. Never use markdown code fences. Never add any text before or after the JSON object.",
+    "messages": [{"role": "user", "content": prompt_text}]
+}
+
+with open('/tmp/claude_request.json', 'w') as f:
+    json.dump(payload, f)
+
+print("Request JSON written successfully")
+PYEOF
+'''
 
 verdict = data.get('verdict', 'UNKNOWN')
 emoji_map = {'PASS': '\\u2705', 'WARN': '\\u26a0\\ufe0f', 'FAIL': '\\u274c'}
