@@ -51,65 +51,40 @@ pipeline {
             }
         }
 
-        stage('Claude Review') {
+       stage('Claude Review') {
             steps {
                 script {
                     def diffText = readFile('pr_diff.txt')
-                    writeFile file: 'prompt.txt', text: "Review this code. Return ONLY JSON. Schema: { \"summary\": \"\", \"verdict\": \"PASS/FAIL\", \"critical_issues\": [], \"warnings\": [] }. \n\n ${diffText}"
+                    writeFile file: 'prompt.txt', text: "Review this code. Return ONLY JSON with: summary, verdict (PASS/FAIL), critical_issues (list of strings). \n\n ${diffText}"
 
                     withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CL_KEY')]) {
                         sh '''
                             export ANTHROPIC_API_KEY=$CL_KEY
-                            # Run Claude, peel the envelope, and save to review_result.json
-                            claude -p "$(cat prompt.txt)" --output-format json | jq -r '.result' > review_result.json
+                            # Run Claude and use jq to clean the output into a single file
+                            claude -p "$(cat prompt.txt)" --output-format json | jq -r '.result' > review.json
                         '''
                     }
-                    
-                    // Read the file we just created
-                    def rawJson = readFile('review_result.json').trim()
-                    
-                    // Clean up any extra markdown backticks if Claude added them
-                    def cleanJson = rawJson.replaceAll("```json", "").replaceAll("```", "").trim()
-                    
-                    // Overwrite the file with the clean version so the next stage finds it
-                    writeFile file: 'review_result.json', text: cleanJson
-                    
-                    // Get the verdict for the GitHub Status
-                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' review_result.json", returnStdout: true).trim()
+                    // Simple check to see if we should mark it as fail
+                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict' review.json", returnStdout: true).trim()
                 }
             }
         }
 
-        stage('Post to GitHub') {
+       stage('Post to GitHub') {
             steps {
-                script {
-                    // This now looks for 'review_result.json', which we know exists
-                    def jsonText = readFile('review_result.json').trim()
-                    def data = new groovy.json.JsonSlurper().parseText(jsonText)
+                withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
+                    sh '''
+                        # USE JQ TO BUILD THE GITHUB COMMENT DIRECTLY IN THE SHELL
+                        # This creates a clean "body" for the GitHub API
+                        jq -n --slurpfile r review.json \
+                        '{body: ("## Claude AI Review: " + $r[0].verdict + "\n\n### Summary\n" + $r[0].summary)}' > payload.json
 
-                    def emoji = (data.verdict == 'PASS') ? "✅" : "❌"
-                    def markdown = "## ${emoji} Claude AI Code Review: ${data.verdict}\n\n### 📝 Summary\n${data.summary}\n\n"
-                    
-                    if (data.critical_issues) {
-                        markdown += "### ⚠️ Critical Issues\n"
-                        data.critical_issues.each { issue ->
-                            markdown += "- **${issue.category}**: ${issue.issue} (File: ${issue.file})\n"
-                        }
-                    }
-
-                    def payload = groovy.json.JsonOutput.toJson([body: markdown])
-                    writeFile file: 'github_payload.json', text: payload
-
-                    withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
-                        sh '''
-                            curl -sf -X POST \
-                                 -H "Authorization: token $TKN" \
-                                 -H "Accept: application/vnd.github.v3+json" \
-                                 -H "Content-Type: application/json" \
-                                 "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
-                                 -d @github_payload.json
-                        '''
-                    }
+                        curl -sf -X POST \
+                             -H "Authorization: token $TKN" \
+                             -H "Content-Type: application/json" \
+                             "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
+                             -d @payload.json
+                    '''
                 }
             }
         }
