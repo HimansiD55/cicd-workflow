@@ -212,13 +212,13 @@ Return ONLY valid JSON:
                     def commentBody = readFile('/tmp/review.json')
 
                     withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        sh """
+                        sh '''
                             curl -sf -X POST \
                                  -H "Authorization: token ${GH_TOKEN}" \
                                  -H "Accept: application/vnd.github.v3+json" \
                                  "https://api.github.com/repos/${env.REPO_PATH}/issues/${env.PR_NUMBER}/comments" \
                                  -d '{"body": ${groovy.json.JsonOutput.toJson(commentBody)}}'
-                        """
+                        '''
                     }
                 }
             }
@@ -232,7 +232,7 @@ Return ONLY valid JSON:
                     def state = stateMap[verdict] ?: 'error'
 
                     withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        sh """
+                        sh '''
                             curl -sf -X POST \
                                  -H "Authorization: token ${GH_TOKEN}" \
                                  -H "Accept: application/vnd.github.v3+json" \
@@ -243,7 +243,7 @@ Return ONLY valid JSON:
                                    "description": "Claude AI review: ${verdict}",
                                    "context": "claude-ai-review"
                                  }'
-                        """
+                        '''
                     }
                 }
             }
@@ -271,13 +271,13 @@ Return ONLY valid JSON:
 
                 if (repoPath && sha) {
                     withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        sh """
+                        sh '''
                             curl -sf -X POST \
                                  -H "Authorization: token ${GH_TOKEN}" \
                                  -H "Accept: application/vnd.github.v3+json" \
                                  "https://api.github.com/repos/${repoPath}/statuses/${sha}" \
                                  -d '{"state":"error","description":"Jenkins pipeline error","context":"claude-ai-review"}' || true
-                        """
+                        '''
                     }
                 }
             }
