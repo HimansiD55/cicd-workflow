@@ -1,8 +1,4 @@
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Jenkinsfile — Claude AI PR Code Review Pipeline
-// ─────────────────────────────────────────────────────────────────────────────
-
 pipeline {
     agent {
         label 'ec2-reviewer'
@@ -14,20 +10,8 @@ pipeline {
         skipDefaultCheckout(true)
     }
 
-    triggers {
-        githubPullRequests(
-            spec: '',
-            triggerMode: 'HEAVY_HOOKS',
-            events: [
-                Open(),
-                NonMergeable(),
-                Commit()
-            ],
-            abortRunning: true
-        )
-    }
+    // ── NO triggers{} block needed — Multibranch Pipeline handles this ────────
 
-    // ── Only keep credentials here. Derived values go inside stages. ──────────
     environment {
         GITHUB_TOKEN   = credentials('github-token')
         CLAUDE_API_KEY = credentials('ANTHROPIC_API_KEY')
@@ -35,7 +19,6 @@ pipeline {
 
     stages {
 
-        // ── Guard: skip non-PR builds ─────────────────────────────────────────
         stage('Validate PR Context') {
             steps {
                 script {
@@ -45,28 +28,21 @@ pipeline {
                         error("Skipping non-PR build — CHANGE_ID is not set")
                     }
 
-                    // ── Derive all repo variables HERE, inside a real script
-                    //    context, after the agent workspace is ready ────────────
                     def gitUrl = env.GIT_URL ?: scm.userRemoteConfigs[0].url ?: ''
-
                     def repoSegments = gitUrl.tokenize('/')
                     env.REPO_OWNER  = repoSegments.size() >= 2 ? repoSegments[-2] : ''
                     env.REPO_NAME   = repoSegments.size() >= 1 ? repoSegments[-1].replace('.git', '') : ''
                     env.REPO_PATH   = "${env.REPO_OWNER}/${env.REPO_NAME}"
-
-                    env.PR_NUMBER   = env.CHANGE_ID   ?: ''
+                    env.PR_NUMBER   = env.CHANGE_ID     ?: ''
                     env.BASE_BRANCH = env.CHANGE_TARGET ?: 'main'
                     env.HEAD_BRANCH = env.CHANGE_BRANCH ?: ''
-                    env.PR_HEAD_SHA = env.GIT_COMMIT  ?: ''
+                    env.PR_HEAD_SHA = env.GIT_COMMIT    ?: ''
 
-                    echo "Repo     : ${env.REPO_PATH}"
-                    echo "PR #     : ${env.PR_NUMBER}"
-                    echo "Branches : ${env.HEAD_BRANCH} → ${env.BASE_BRANCH}"
+                    echo "Repo: ${env.REPO_PATH} | PR #${env.PR_NUMBER} | ${env.HEAD_BRANCH} → ${env.BASE_BRANCH}"
                 }
             }
         }
 
-        // ── Stage 1: Checkout ─────────────────────────────────────────────────
         stage('Checkout') {
             steps {
                 script {
@@ -89,7 +65,6 @@ pipeline {
             }
         }
 
-        // ── Stage 2: Get PR Diff ──────────────────────────────────────────────
         stage('Get PR Diff') {
             steps {
                 script {
@@ -129,12 +104,11 @@ pipeline {
                     writeFile file: '/tmp/pr_files.txt', text: changedFiles
                     writeFile file: '/tmp/pr_meta.json', text: prMetadata
 
-                    echo "Diff size: ${diff.size()} bytes | Changed files:\n${changedFiles}"
+                    echo "Diff size: ${diff.size()} bytes | Files:\n${changedFiles}"
                 }
             }
         }
 
-        // ── Stage 3: Claude AI Review ─────────────────────────────────────────
         stage('Claude AI Review') {
             steps {
                 script {
@@ -151,59 +125,44 @@ ${prMeta}
 ${changedFiles}
 
 ## Code Diff
-```diff
+\`\`\`diff
 ${diff}
-```
+\`\`\`
 
 ## Review Instructions
 
 Analyze the diff carefully and provide a structured review covering ALL of the following categories. For each issue found, include the **file name and line number** where possible.
 
-### 1. 🔒 Security Vulnerabilities
+### 1. Security Vulnerabilities
 - SQL injection, XSS, CSRF, insecure deserialization
 - Improper authentication or authorization
-- Insecure use of cryptography
-- Server-side request forgery (SSRF)
-- Any OWASP Top 10 issues
+- Insecure use of cryptography, SSRF, OWASP Top 10
 
-### 2. 🔑 Secrets & Credential Leaks (CRITICAL)
+### 2. Secrets & Credential Leaks (CRITICAL)
 - Hardcoded API keys, tokens, passwords, private keys
 - Database connection strings with credentials
-- Any secrets that should be in environment variables
 - Base64 encoded secrets
 
-### 3. 🐛 Logic Bugs & Correctness
-- Off-by-one errors, null/undefined dereferences
-- Race conditions, deadlocks
-- Incorrect error handling or swallowed exceptions
-- Edge cases not handled
+### 3. Logic Bugs & Correctness
+- Off-by-one errors, null dereferences, race conditions
+- Incorrect error handling, unhandled edge cases
 
-### 4. 📦 Dependency Issues
-- Known vulnerable package versions (if visible in diff)
-- Unnecessary or overly broad dependencies
-- Missing dependency pinning
+### 4. Dependency Issues
+- Vulnerable package versions, missing pinning
 
-### 5. 🏗️ Code Quality & Best Practices
-- DRY violations, overly complex functions
-- Missing input validation
-- Poor naming or unclear intent
-- Missing or inadequate error handling
-- Functions that are too long (>50 lines)
+### 5. Code Quality & Best Practices
+- DRY violations, missing input validation, poor naming
+- Functions over 50 lines, inadequate error handling
 
-### 6. ⚡ Performance Issues
-- N+1 query patterns
-- Missing pagination on list endpoints
-- Inefficient algorithms or data structures
-- Unnecessary blocking operations
-
----
+### 6. Performance Issues
+- N+1 queries, missing pagination, inefficient algorithms
 
 ## Output Format
 
-Respond in this EXACT format (valid JSON only, no markdown outside the JSON):
+Respond with valid JSON only — no markdown, no preamble:
 
 {
-  "summary": "One paragraph overall assessment of this PR.",
+  "summary": "One paragraph overall assessment.",
   "verdict": "PASS",
   "verdict_reason": "One sentence explaining the verdict.",
   "critical_issues": [],
@@ -212,12 +171,12 @@ Respond in this EXACT format (valid JSON only, no markdown outside the JSON):
   "positive_notes": []
 }
 
-verdict must be one of: PASS, WARN, FAIL
-- FAIL  → any CRITICAL issue found (security, secrets, crashes)
-- WARN  → warnings found but no critical blockers
-- PASS  → only suggestions or positive notes
+verdict must be: PASS, WARN, or FAIL
+- FAIL  = any critical issue (security, secrets, crashes)
+- WARN  = warnings but no critical blockers
+- PASS  = only suggestions or positives
 
-Be specific and actionable. Do not hallucinate line numbers — only include them if you can see them in the diff."""
+Each issue object must have: category, file, line (or "?"), issue, recommendation"""
 
                     def escapedPrompt = prompt
                         .replace('\\', '\\\\')
@@ -229,12 +188,7 @@ Be specific and actionable. Do not hallucinate line numbers — only include the
                     writeFile file: '/tmp/claude_request.json', text: """{
   "model": "claude-sonnet-4-5",
   "max_tokens": 4096,
-  "messages": [
-    {
-      "role": "user",
-      "content": "${escapedPrompt}"
-    }
-  ]
+  "messages": [{"role": "user", "content": "${escapedPrompt}"}]
 }"""
 
                     def response = sh(
@@ -260,22 +214,19 @@ Be specific and actionable. Do not hallucinate line numbers — only include the
                     echo "Claude review received (${reviewJson.size()} bytes)"
 
                     sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
-                    def verdict = readFile('/tmp/verdict.txt').trim()
-
-                    env.REVIEW_VERDICT = verdict
-                    echo "Verdict: ${verdict}"
+                    env.REVIEW_VERDICT = readFile('/tmp/verdict.txt').trim()
+                    echo "Verdict: ${env.REVIEW_VERDICT}"
                 }
             }
         }
 
-        // ── Stage 4: Post Comment on GitHub PR ────────────────────────────────
         stage('Post PR Comment') {
             steps {
                 script {
                     def commentBody = sh(
                         script: """
 python3 - <<'PYEOF'
-import json, sys
+import json
 
 with open('/tmp/review.json') as f:
     data = json.load(f)
@@ -285,7 +236,7 @@ emoji_map = {'PASS': '\\u2705', 'WARN': '\\u26a0\\ufe0f', 'FAIL': '\\u274c'}
 emoji = emoji_map.get(verdict, '\\U0001f50d')
 
 lines = []
-lines.append(f"## {emoji} Claude AI Code Review \\u2014 {verdict}")
+lines.append(f"## {emoji} Claude AI Code Review \u2014 {verdict}")
 lines.append("")
 lines.append(f"**{data.get('verdict_reason', '')}**")
 lines.append("")
@@ -296,35 +247,35 @@ lines.append("")
 critical = data.get('critical_issues', [])
 if critical:
     lines.append("---")
-    lines.append("### Critical Issues (must fix before merge)")
+    lines.append("### \ud83d\udd34 Critical Issues (must fix before merge)")
     for i, issue in enumerate(critical, 1):
-        lines.append(f"**{i}. [{issue['category']}] {issue['file']}:{issue.get('line','?')}**")
-        lines.append(f"> {issue['issue']}")
-        lines.append(f"Fix: {issue['recommendation']}")
+        lines.append(f"**{i}. [{issue.get('category','')}] {issue.get('file','')}:{issue.get('line','?')}**")
+        lines.append(f"> {issue.get('issue','')}")
+        lines.append(f"Fix: {issue.get('recommendation','')}")
         lines.append("")
 
 warnings = data.get('warnings', [])
 if warnings:
     lines.append("---")
-    lines.append("### Warnings (should fix)")
+    lines.append("### \u26a0\ufe0f Warnings (should fix)")
     for i, w in enumerate(warnings, 1):
-        lines.append(f"**{i}. [{w['category']}] {w['file']}:{w.get('line','?')}**")
-        lines.append(f"> {w['issue']}")
-        lines.append(f"{w['recommendation']}")
+        lines.append(f"**{i}. [{w.get('category','')}] {w.get('file','')}:{w.get('line','?')}**")
+        lines.append(f"> {w.get('issue','')}")
+        lines.append(f"{w.get('recommendation','')}")
         lines.append("")
 
 suggestions = data.get('suggestions', [])
 if suggestions:
     lines.append("---")
-    lines.append("### Suggestions (nice to have)")
+    lines.append("### \ud83d\udca1 Suggestions (nice to have)")
     for s in suggestions:
-        lines.append(f"- [{s['category']}] {s['file']}: {s['issue']} - {s['recommendation']}")
+        lines.append(f"- [{s.get('category','')}] {s.get('file','')}: {s.get('issue','')} \u2014 {s.get('recommendation','')}")
     lines.append("")
 
 positives = data.get('positive_notes', [])
 if positives:
     lines.append("---")
-    lines.append("### What is done well")
+    lines.append("### \u2728 What is done well")
     for p in positives:
         lines.append(f"- {p}")
     lines.append("")
@@ -359,7 +310,6 @@ print(json.dumps({'body': body}))
             }
         }
 
-        // ── Stage 5: Set GitHub Commit Status ─────────────────────────────────
         stage('Set PR Status') {
             steps {
                 script {
@@ -375,7 +325,6 @@ print(json.dumps({'body': body}))
 
                     def state       = stateMap[verdict] ?: 'error'
                     def description = descMap[verdict]  ?: 'Review status unknown'
-                    def buildUrl    = env.BUILD_URL ?: ''
 
                     sh """
                         curl -sf -X POST \\
@@ -385,7 +334,7 @@ print(json.dumps({'body': body}))
                              "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" \\
                              -d '{
                                "state":       "${state}",
-                               "target_url":  "${buildUrl}",
+                               "target_url":  "${env.BUILD_URL}",
                                "description": "${description}",
                                "context":     "claude-ai-review"
                              }' \\
@@ -396,20 +345,15 @@ print(json.dumps({'body': body}))
         }
     }
 
-    // ── Post actions ──────────────────────────────────────────────────────────
     post {
         always {
-            // ── node{} wrapper ensures workspace context is available ──────────
-            node('ec2-reviewer') {
-                sh 'rm -f /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/comment_body.txt /tmp/verdict.txt || true'
-            }
+            sh 'rm -f /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/pr_files.txt /tmp/pr_meta.json /tmp/review.json /tmp/comment_body.txt /tmp/verdict.txt || true'
             cleanWs()
         }
 
         success {
             script {
-                def verdict = env.REVIEW_VERDICT ?: 'UNKNOWN'
-                if (verdict == 'FAIL') {
+                if ((env.REVIEW_VERDICT ?: 'UNKNOWN') == 'FAIL') {
                     currentBuild.result = 'UNSTABLE'
                 }
             }
