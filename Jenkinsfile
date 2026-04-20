@@ -209,22 +209,23 @@ Return ONLY valid JSON:
         stage('Post PR Comment') {
             steps {
                 script {
-                    def commentBody = readFile('/tmp/review.json')
-
+                    // Read the file content into a variable
+                    def reviewContent = readFile('/tmp/review.json').trim()
+                    
                     withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        sh '''
+                        sh """
                             curl -sf -X POST \
-                                 -H "Authorization: token ${GH_TOKEN}" \
+                                 -H "Authorization: token \$GH_TOKEN" \
                                  -H "Accept: application/vnd.github.v3+json" \
                                  "https://api.github.com/repos/${env.REPO_PATH}/issues/${env.PR_NUMBER}/comments" \
-                                 -d '{"body": ${groovy.json.JsonOutput.toJson(commentBody)}}'
-                        '''
+                                 -d '{"body": ${groovy.json.JsonOutput.toJson(reviewContent)}}'
+                        """
                     }
                 }
             }
         }
-
-        stage('Set PR Status') {
+        
+       stage('Set PR Status') {
             steps {
                 script {
                     def verdict = env.REVIEW_VERDICT ?: 'UNKNOWN'
@@ -232,9 +233,9 @@ Return ONLY valid JSON:
                     def state = stateMap[verdict] ?: 'error'
 
                     withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        sh '''
+                        sh """
                             curl -sf -X POST \
-                                 -H "Authorization: token ${GH_TOKEN}" \
+                                 -H "Authorization: token \$GH_TOKEN" \
                                  -H "Accept: application/vnd.github.v3+json" \
                                  "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" \
                                  -d '{
@@ -243,7 +244,7 @@ Return ONLY valid JSON:
                                    "description": "Claude AI review: ${verdict}",
                                    "context": "claude-ai-review"
                                  }'
-                        '''
+                        """
                     }
                 }
             }
