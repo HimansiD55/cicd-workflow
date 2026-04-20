@@ -109,13 +109,14 @@ pipeline {
             }
         }
 
-        stage('Claude AI Review') {
+       stage('Claude AI Review') {
             steps {
                 script {
                     def diff         = readFile('/tmp/pr_diff.txt').trim()
                     def changedFiles = readFile('/tmp/pr_files.txt').trim()
                     def prMeta       = readFile('/tmp/pr_meta.json').trim()
 
+                    // Write prompt to a plain file — no Groovy string escaping needed
                     def prompt = """You are a senior software engineer performing a thorough code review of a GitHub Pull Request.
 
 ## PR Metadata
@@ -131,35 +132,18 @@ ${diff}
 
 ## Review Instructions
 
-Analyze the diff carefully and provide a structured review covering ALL of the following categories. For each issue found, include the **file name and line number** where possible.
+Analyze the diff carefully. For each issue include the file name and line number where possible.
 
-### 1. Security Vulnerabilities
-- SQL injection, XSS, CSRF, insecure deserialization
-- Improper authentication or authorization
-- Insecure use of cryptography, SSRF, OWASP Top 10
-
-### 2. Secrets & Credential Leaks (CRITICAL)
-- Hardcoded API keys, tokens, passwords, private keys
-- Database connection strings with credentials
-- Base64 encoded secrets
-
-### 3. Logic Bugs & Correctness
-- Off-by-one errors, null dereferences, race conditions
-- Incorrect error handling, unhandled edge cases
-
-### 4. Dependency Issues
-- Vulnerable package versions, missing pinning
-
-### 5. Code Quality & Best Practices
-- DRY violations, missing input validation, poor naming
-- Functions over 50 lines, inadequate error handling
-
-### 6. Performance Issues
-- N+1 queries, missing pagination, inefficient algorithms
+1. Security Vulnerabilities - SQL injection, XSS, CSRF, insecure deserialization, improper auth, SSRF, OWASP Top 10
+2. Secrets and Credential Leaks (CRITICAL) - Hardcoded API keys, tokens, passwords, private keys, base64 encoded secrets
+3. Logic Bugs and Correctness - Off-by-one errors, null dereferences, race conditions, unhandled edge cases
+4. Dependency Issues - Vulnerable package versions, missing pinning
+5. Code Quality and Best Practices - DRY violations, missing input validation, poor naming, functions over 50 lines
+6. Performance Issues - N+1 queries, missing pagination, inefficient algorithms
 
 ## Output Format
 
-Respond with valid JSON only — no markdown, no preamble:
+Respond with valid JSON only. No markdown, no preamble, nothing outside the JSON object:
 
 {
   "summary": "One paragraph overall assessment.",
@@ -171,25 +155,34 @@ Respond with valid JSON only — no markdown, no preamble:
   "positive_notes": []
 }
 
-verdict must be: PASS, WARN, or FAIL
-- FAIL  = any critical issue (security, secrets, crashes)
-- WARN  = warnings but no critical blockers
-- PASS  = only suggestions or positives
+verdict must be PASS, WARN, or FAIL.
+FAIL = any critical issue. WARN = warnings but no blockers. PASS = only suggestions or positives.
+Each issue object must have: category, file, line (use ? if unknown), issue, recommendation"""
 
-Each issue object must have: category, file, line (or "?"), issue, recommendation"""
+                    // Use Python to safely build the JSON — avoids ALL escaping issues
+                    writeFile file: '/tmp/prompt.txt', text: prompt
 
-                    def escapedPrompt = prompt
-                        .replace('\\', '\\\\')
-                        .replace('"',  '\\"')
-                        .replace('\n', '\\n')
-                        .replace('\r', '\\r')
-                        .replace('\t', '\\t')
+                    sh '''
+python3 - <<'PYEOF'
+import json
 
-                    writeFile file: '/tmp/claude_request.json', text: """{
-  "model": "claude-sonnet-4-5",
-  "max_tokens": 4096,
-  "messages": [{"role": "user", "content": "${escapedPrompt}"}]
-}"""
+with open('/tmp/prompt.txt', 'r') as f:
+    prompt_text = f.read()
+
+payload = {
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 4096,
+    "messages": [
+        {"role": "user", "content": prompt_text}
+    ]
+}
+
+with open('/tmp/claude_request.json', 'w') as f:
+    json.dump(payload, f)
+
+print("Request JSON written successfully")
+PYEOF
+'''
 
                     def response = sh(
                         script: """
@@ -205,10 +198,19 @@ Each issue object must have: category, file, line (or "?"), issue, recommendatio
 
                     writeFile file: '/tmp/claude_response.json', text: response
 
+                    // Validate we got a proper response before extracting
                     def reviewJson = sh(
-                        script: "jq -r '.content[0].text' /tmp/claude_response.json",
+                        script: """
+                            jq -r '.content[0].text // empty' /tmp/claude_response.json || echo ''
+                        """,
                         returnStdout: true
                     ).trim()
+
+                    if (!reviewJson) {
+                        echo "Raw API response:"
+                        sh 'cat /tmp/claude_response.json'
+                        error("Claude API returned no content — check response above")
+                    }
 
                     writeFile file: '/tmp/review.json', text: reviewJson
                     echo "Claude review received (${reviewJson.size()} bytes)"
