@@ -87,10 +87,31 @@ pipeline {
         stage('Post to GitHub') {
             steps {
                 script {
-                    // Read the CLEANED review, not the raw CLI output
-                    def reviewContent = readFile('clean_review.json').trim()
-                    def jsonPayload = groovy.json.JsonOutput.toJson([body: reviewContent])
-                    writeFile file: 'payload.json', text: jsonPayload
+                    // 1. Read and parse the JSON file
+                    def jsonText = readFile('final_review.json').trim()
+                    def data = new groovy.json.JsonSlurper().parseText(jsonText)
+
+                    // 2. Build a Clean Markdown Report
+                    def emoji = (data.verdict == 'PASS') ? "✅" : "❌"
+                    def markdown = """
+## ${emoji} Claude AI Code Review: ${data.verdict}
+
+### 📝 Summary
+${data.summary}
+
+### ⚠️ Issues Found
+"""
+                    // Add critical issues to the report
+                    data.critical_issues.each { issue ->
+                        markdown += "- **[CRITICAL]** ${issue.file}: ${issue.issue}\n"
+                        markdown += "  *Fix:* ${issue.recommendation}\n\n"
+                    }
+
+                    markdown += "\n--- \n*Sent from Jenkins via Claude AI*"
+
+                    // 3. Post the Clean Markdown
+                    def payload = groovy.json.JsonOutput.toJson([body: markdown])
+                    writeFile file: 'github_payload.json', text: payload
 
                     withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
                         sh '''
@@ -99,7 +120,7 @@ pipeline {
                                  -H "Accept: application/vnd.github.v3+json" \
                                  -H "Content-Type: application/json" \
                                  "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
-                                 -d @payload.json
+                                 -d @github_payload.json
                         '''
                     }
                 }
