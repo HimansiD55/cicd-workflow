@@ -14,19 +14,6 @@ pipeline {
         skipDefaultCheckout(true)
     }
 
-    triggers {
-        githubPullRequests(
-            spec: '',
-            triggerMode: 'HEAVY_HOOKS',
-            events: [
-                Open(),
-                NonMergeable(),
-                Commit()
-            ],
-            abortRunning: true
-        )
-    }
-
     environment {
         GITHUB_TOKEN   = credentials('github-token')
         CLAUDE_API_KEY = credentials('ANTHROPIC_API_KEY')
