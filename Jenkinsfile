@@ -1,4 +1,3 @@
-
 pipeline {
     agent {
         label 'ec2-reviewer'
@@ -36,7 +35,7 @@ pipeline {
                     env.HEAD_BRANCH = env.CHANGE_BRANCH ?: ''
                     env.PR_HEAD_SHA = env.GIT_COMMIT    ?: ''
 
-                    echo "Repo: ${env.REPO_PATH} | PR #${env.PR_NUMBER} | ${env.HEAD_BRANCH} → ${env.BASE_BRANCH}"
+                    echo "Repo: ${env.REPO_PATH} | PR #${env.PR_NUMBER} | ${env.HEAD_BRANCH} -> ${env.BASE_BRANCH}"
                 }
             }
         }
@@ -79,7 +78,7 @@ pipeline {
                     ).trim()
 
                     if (!diff) {
-                        diff = "No meaningful code changes detected (only lock files or build artifacts changed)."
+                        diff = "No meaningful code changes detected."
                     }
 
                     def changedFiles = sh(
@@ -225,26 +224,11 @@ PYEOF
                 script {
                     def commentBody = sh(
                         script: """
-sh '''
 python3 - <<'PYEOF'
 import json
 
-with open('/tmp/prompt.txt', 'r') as f:
-    prompt_text = f.read()
-
-payload = {
-    "model": "claude-sonnet-4-5",
-    "max_tokens": 4096,
-    "system": "You are a code review assistant. Always respond with pure valid JSON only. Never use markdown code fences. Never add any text before or after the JSON object.",
-    "messages": [{"role": "user", "content": prompt_text}]
-}
-
-with open('/tmp/claude_request.json', 'w') as f:
-    json.dump(payload, f)
-
-print("Request JSON written successfully")
-PYEOF
-'''
+with open('/tmp/review.json') as f:
+    data = json.load(f)
 
 verdict = data.get('verdict', 'UNKNOWN')
 emoji_map = {'PASS': '\\u2705', 'WARN': '\\u26a0\\ufe0f', 'FAIL': '\\u274c'}
@@ -333,10 +317,10 @@ print(json.dumps({'body': body}))
                     def verdict     = env.REVIEW_VERDICT ?: 'UNKNOWN'
                     def stateMap    = [PASS: 'success', WARN: 'success', FAIL: 'failure', UNKNOWN: 'error']
                     def descMap     = [
-                        PASS:    'Claude AI review passed — no critical issues found',
+                        PASS:    'Claude AI review passed - no critical issues found',
                         WARN:    'Claude AI review: warnings found, review recommended',
-                        FAIL:    'Claude AI review FAILED — critical issues must be resolved',
-                        UNKNOWN: 'Claude AI review error — check Jenkins logs'
+                        FAIL:    'Claude AI review FAILED - critical issues must be resolved',
+                        UNKNOWN: 'Claude AI review error - check Jenkins logs'
                     ]
                     def state       = stateMap[verdict] ?: 'error'
                     def description = descMap[verdict]  ?: 'Review status unknown'
