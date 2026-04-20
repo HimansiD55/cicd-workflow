@@ -384,8 +384,10 @@ print(json.dumps({'body': body}))
     // ── Post actions ──────────────────────────────────────────────────────────
     post {
         always {
-            sh 'rm -f /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/comment_body.txt /tmp/verdict.txt'
-            cleanWs()
+            script {
+                sh 'rm -f /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/comment_body.txt /tmp/verdict.txt'
+                cleanWs()
+            }
         }
 
         success {
@@ -399,15 +401,18 @@ print(json.dumps({'body': body}))
 
         failure {
             script {
+                // If this curl command is running outside a node, it will fail
+                // We use the environment variables we captured earlier
                 def repoSegments = env.GIT_URL?.tokenize('/')
-                def repoPath     = repoSegments ? "${repoSegments[-2]}/${repoSegments[-1]?.replace('.git','')}" : ''
-                def sha          = env.PR_HEAD_SHA ?: ''
+                def repoPath = repoSegments ? "${repoSegments[-2]}/${repoSegments[-1]?.replace('.git','')}" : ''
+                def sha = env.PR_HEAD_SHA ?: ''
+                
                 if (repoPath && sha) {
                     sh """
-                        curl -sf -X POST \\
-                             -H "Authorization: token ${GITHUB_TOKEN}" \\
-                             -H "Accept: application/vnd.github.v3+json" \\
-                             "https://api.github.com/repos/${repoPath}/statuses/${sha}" \\
+                        curl -sf -X POST \
+                             -H "Authorization: token ${GITHUB_TOKEN}" \
+                             -H "Accept: application/vnd.github.v3+json" \
+                             "https://api.github.com/repos/${repoPath}/statuses/${sha}" \
                              -d '{"state":"error","description":"Jenkins pipeline error","context":"claude-ai-review"}' || true
                     """
                 }
