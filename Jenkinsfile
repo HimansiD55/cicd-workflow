@@ -188,43 +188,30 @@ PYEOF
                                 --max-time 90)
 
                             echo "HTTP Status: ${HTTP_STATUS}"
-                            cat /tmp/claude_response.json
 
                             if [ "$HTTP_STATUS" != "200" ]; then
+                                cat /tmp/claude_response.json
                                 echo "ERROR: Anthropic API returned HTTP ${HTTP_STATUS}"
                                 exit 1
                             fi
                         '''
                     }
 
-                    def reviewJson = sh(
-                        script: """
-                            jq -r '.content[0].text // empty' /tmp/claude_response.json \
-                            | sed 's/^```json//' \
-                            | sed 's/^```//' \
-                            | tr -d '\\r' \
+                    sh '''
+                        jq -r '.content[0].text // empty' /tmp/claude_response.json \
+                            | sed 's/^```json[[:space:]]*//' \
+                            | sed 's/^```[[:space:]]*//' \
+                            | sed 's/[[:space:]]*```$//' \
                             | awk 'NF' \
                             > /tmp/review.json
-                            cat /tmp/review.json
-                        """,
-                        returnStdout: false
-                    )
+                    '''
 
                     def reviewContent = readFile('/tmp/review.json').trim()
-
-                   
-                    echo "Claude review received (${reviewContent.size()} bytes)"
-
-                    sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
-                    env.REVIEW_VERDICT = readFile('/tmp/verdict.txt').trim()
-                    echo "Verdict: ${env.REVIEW_VERDICT}"
-
-                    if (!reviewJson) {
+                    if (!reviewContent) {
                         error("Claude API returned no content")
                     }
 
-                    writeFile file: '/tmp/review.json', text: reviewJson
-                    echo "Claude review received (${reviewJson.size()} bytes)"
+                    echo "Claude review received (${reviewContent.size()} bytes)"
 
                     sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
                     env.REVIEW_VERDICT = readFile('/tmp/verdict.txt').trim()
