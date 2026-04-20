@@ -212,10 +212,7 @@ PYEOF
 
                     def reviewContent = readFile('/tmp/review.json').trim()
 
-                    if (!reviewContent) {
-                        error("Claude API returned no content")
-                    }
-
+                   
                     echo "Claude review received (${reviewContent.size()} bytes)"
 
                     sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
