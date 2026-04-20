@@ -10,8 +10,6 @@ pipeline {
         skipDefaultCheckout(true)
     }
 
-    // ── NO triggers{} block needed — Multibranch Pipeline handles this ────────
-
     environment {
         GITHUB_TOKEN   = credentials('github-token')
         CLAUDE_API_KEY = credentials('ANTHROPIC_API_KEY')
@@ -108,22 +106,8 @@ pipeline {
                 }
             }
         }
-         def response = sh(
-                        script: """
-                            curl -s -X POST "https://api.anthropic.com/v1/messages" \\
-                                 -H "x-api-key: ${CLAUDE_API_KEY}" \\
-                                 -H "anthropic-version: 2023-06-01" \\
-                                 -H "content-type: application/json" \\
-                                 --data @/tmp/claude_request.json \\
-                                 --max-time 90 \\
-                                 -w "\\nHTTP_STATUS:%{http_code}"
-                        """,
-                        returnStdout: true
-                    ).trim()
 
-                    echo "API Response: ${response}"
-                    writeFile file: '/tmp/claude_response.json', text: response.split('HTTP_STATUS:')[0]
-       stage('Claude AI Review') {
+        stage('Claude AI Review') {
             steps {
                 script {
                     def diff         = readFile('/tmp/pr_diff.txt').trim()
@@ -192,7 +176,6 @@ print("Request JSON written successfully")
 PYEOF
 '''
 
-                    // Use withCredentials to safely inject the key into shell env
                     withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CLAUDE_KEY')]) {
                         sh '''
                             HTTP_STATUS=$(curl -s -o /tmp/claude_response.json -w "%{http_code}" \
@@ -231,8 +214,6 @@ PYEOF
                 }
             }
         }
-            }
-        }
 
         stage('Post PR Comment') {
             steps {
@@ -250,7 +231,7 @@ emoji_map = {'PASS': '\\u2705', 'WARN': '\\u26a0\\ufe0f', 'FAIL': '\\u274c'}
 emoji = emoji_map.get(verdict, '\\U0001f50d')
 
 lines = []
-lines.append(f"## {emoji} Claude AI Code Review \u2014 {verdict}")
+lines.append(f"## {emoji} Claude AI Code Review - {verdict}")
 lines.append("")
 lines.append(f"**{data.get('verdict_reason', '')}**")
 lines.append("")
@@ -261,7 +242,7 @@ lines.append("")
 critical = data.get('critical_issues', [])
 if critical:
     lines.append("---")
-    lines.append("### \ud83d\udd34 Critical Issues (must fix before merge)")
+    lines.append("### Critical Issues (must fix before merge)")
     for i, issue in enumerate(critical, 1):
         lines.append(f"**{i}. [{issue.get('category','')}] {issue.get('file','')}:{issue.get('line','?')}**")
         lines.append(f"> {issue.get('issue','')}")
@@ -271,7 +252,7 @@ if critical:
 warnings = data.get('warnings', [])
 if warnings:
     lines.append("---")
-    lines.append("### \u26a0\ufe0f Warnings (should fix)")
+    lines.append("### Warnings (should fix)")
     for i, w in enumerate(warnings, 1):
         lines.append(f"**{i}. [{w.get('category','')}] {w.get('file','')}:{w.get('line','?')}**")
         lines.append(f"> {w.get('issue','')}")
@@ -281,15 +262,15 @@ if warnings:
 suggestions = data.get('suggestions', [])
 if suggestions:
     lines.append("---")
-    lines.append("### \ud83d\udca1 Suggestions (nice to have)")
+    lines.append("### Suggestions (nice to have)")
     for s in suggestions:
-        lines.append(f"- [{s.get('category','')}] {s.get('file','')}: {s.get('issue','')} \u2014 {s.get('recommendation','')}")
+        lines.append(f"- [{s.get('category','')}] {s.get('file','')}: {s.get('issue','')} - {s.get('recommendation','')}")
     lines.append("")
 
 positives = data.get('positive_notes', [])
 if positives:
     lines.append("---")
-    lines.append("### \u2728 What is done well")
+    lines.append("### What is done well")
     for p in positives:
         lines.append(f"- {p}")
     lines.append("")
@@ -305,21 +286,23 @@ PYEOF
 
                     writeFile file: '/tmp/comment_body.txt', text: commentBody
 
-                    sh """
-                        COMMENT_JSON=\$(python3 -c "
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
+                        sh '''
+                            COMMENT_JSON=$(python3 -c "
 import json
 with open('/tmp/comment_body.txt') as f:
     body = f.read()
 print(json.dumps({'body': body}))
 ")
-                        curl -sf -X POST \\
-                             -H "Authorization: token ${GITHUB_TOKEN}" \\
-                             -H "Accept: application/vnd.github.v3+json" \\
-                             -H "Content-Type: application/json" \\
-                             "https://api.github.com/repos/${env.REPO_PATH}/issues/${env.PR_NUMBER}/comments" \\
-                             -d "\$COMMENT_JSON" \\
-                        && echo "Comment posted successfully"
-                    """
+                            curl -sf -X POST \
+                                 -H "Authorization: token ${GH_TOKEN}" \
+                                 -H "Accept: application/vnd.github.v3+json" \
+                                 -H "Content-Type: application/json" \
+                                 "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
+                                 -d "${COMMENT_JSON}" \
+                            && echo "Comment posted successfully"
+                        '''
+                    }
                 }
             }
         }
@@ -327,33 +310,33 @@ print(json.dumps({'body': body}))
         stage('Set PR Status') {
             steps {
                 script {
-                    def verdict = env.REVIEW_VERDICT ?: 'UNKNOWN'
-
-                    def stateMap = [PASS: 'success', WARN: 'success', FAIL: 'failure', UNKNOWN: 'error']
-                    def descMap  = [
+                    def verdict     = env.REVIEW_VERDICT ?: 'UNKNOWN'
+                    def stateMap    = [PASS: 'success', WARN: 'success', FAIL: 'failure', UNKNOWN: 'error']
+                    def descMap     = [
                         PASS:    'Claude AI review passed — no critical issues found',
                         WARN:    'Claude AI review: warnings found, review recommended',
                         FAIL:    'Claude AI review FAILED — critical issues must be resolved',
                         UNKNOWN: 'Claude AI review error — check Jenkins logs'
                     ]
-
                     def state       = stateMap[verdict] ?: 'error'
                     def description = descMap[verdict]  ?: 'Review status unknown'
 
-                    sh """
-                        curl -sf -X POST \\
-                             -H "Authorization: token ${GITHUB_TOKEN}" \\
-                             -H "Accept: application/vnd.github.v3+json" \\
-                             -H "Content-Type: application/json" \\
-                             "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" \\
-                             -d '{
-                               "state":       "${state}",
-                               "target_url":  "${env.BUILD_URL}",
-                               "description": "${description}",
-                               "context":     "claude-ai-review"
-                             }' \\
-                        && echo "Status set to: ${state}"
-                    """
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
+                        sh """
+                            curl -sf -X POST \
+                                 -H "Authorization: token ${GH_TOKEN}" \
+                                 -H "Accept: application/vnd.github.v3+json" \
+                                 -H "Content-Type: application/json" \
+                                 "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" \
+                                 -d '{
+                                   "state":       "${state}",
+                                   "target_url":  "${env.BUILD_URL}",
+                                   "description": "${description}",
+                                   "context":     "claude-ai-review"
+                                 }' \
+                            && echo "Status set to: ${state}"
+                        """
+                    }
                 }
             }
         }
@@ -361,7 +344,7 @@ print(json.dumps({'body': body}))
 
     post {
         always {
-            sh 'rm -f /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/pr_files.txt /tmp/pr_meta.json /tmp/review.json /tmp/comment_body.txt /tmp/verdict.txt || true'
+            sh 'rm -f /tmp/prompt.txt /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/pr_files.txt /tmp/pr_meta.json /tmp/review.json /tmp/comment_body.txt /tmp/verdict.txt || true'
             cleanWs()
         }
 
@@ -378,13 +361,15 @@ print(json.dumps({'body': body}))
                 def repoPath = env.REPO_PATH ?: ''
                 def sha      = env.PR_HEAD_SHA ?: ''
                 if (repoPath && sha) {
-                    sh """
-                        curl -sf -X POST \\
-                             -H "Authorization: token ${GITHUB_TOKEN}" \\
-                             -H "Accept: application/vnd.github.v3+json" \\
-                             "https://api.github.com/repos/${repoPath}/statuses/${sha}" \\
-                             -d '{"state":"error","description":"Jenkins pipeline error","context":"claude-ai-review"}' || true
-                    """
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
+                        sh """
+                            curl -sf -X POST \
+                                 -H "Authorization: token ${GH_TOKEN}" \
+                                 -H "Accept: application/vnd.github.v3+json" \
+                                 "https://api.github.com/repos/${repoPath}/statuses/${sha}" \
+                                 -d '{"state":"error","description":"Jenkins pipeline error","context":"claude-ai-review"}' || true
+                        """
+                    }
                 }
             }
         }
