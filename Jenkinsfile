@@ -216,26 +216,37 @@ If no issues found, return an empty issues array and verdict PASS."""
                              -d "$BODY"
 
                         # Also post inline review comments for each issue (GitHub Review API)
-                        jq -c '.issues[]' review.json | while read issue; do
-                            FILE=$(echo $issue | jq -r '.file')
-                            LINE=$(echo $issue | jq -r '.line')
-                            TITLE=$(echo $issue | jq -r '.title')
-                            DETAIL=$(echo $issue | jq -r '.detail')
-                            SEV=$(echo $issue | jq -r '.severity')
-
-                            INLINE_BODY=$(jq -n \
-                                --arg body "**[$SEV] $TITLE**\n\n$DETAIL" \
-                                --arg path "$FILE" \
-                                --arg sha "${PR_HEAD_SHA}" \
-                                --argjson line "$LINE" \
-                                '{commit_id: $sha, path: $path, line: $line, side: "RIGHT", body: $body}')
-
-                            curl -sf -X POST \
-                                 -H "Authorization: token $TKN" \
-                                 -H "Content-Type: application/json" \
-                                 "https://api.github.com/repos/${REPO_PATH}/pulls/${PR_NUMBER}/comments" \
-                                 -d "$INLINE_BODY" || true  # don't fail if line doesn't exist in diff
-                        done
+                    ISSUE_COUNT=$(jq '.issues | length' review.json)
+                    i=0
+                    while [ $i -lt $ISSUE_COUNT ]; do
+                        # Write single issue to temp file to avoid shell escaping issues
+                        jq -c ".issues[$i]" review.json > /tmp/issue_item.json
+                    
+                        FILE=$(jq -r '.file' /tmp/issue_item.json)
+                        LINE=$(jq -r '.line' /tmp/issue_item.json)
+                        TITLE=$(jq -r '.title' /tmp/issue_item.json)
+                        DETAIL=$(jq -r '.detail' /tmp/issue_item.json)
+                        SEV=$(jq -r '.severity' /tmp/issue_item.json)
+                    
+                        # Validate LINE is a real integer before proceeding
+                        echo "$LINE" | grep -qE '^[0-9]+$' || { i=$((i+1)); continue; }
+                    
+                        # Build inline body safely using jq (never touches shell string interpolation)
+                        jq -n \
+                            --arg body "**[$SEV] $TITLE**\n\n$DETAIL" \
+                            --arg path "$FILE" \
+                            --arg sha "${PR_HEAD_SHA}" \
+                            --argjson line "$LINE" \
+                            '{commit_id: $sha, path: $path, line: $line, side: "RIGHT", body: $body}' > /tmp/inline_payload.json
+                    
+                        curl -sf -X POST \
+                             -H "Authorization: token $TKN" \
+                             -H "Content-Type: application/json" \
+                             "https://api.github.com/repos/${REPO_PATH}/pulls/${PR_NUMBER}/comments" \
+                             -d @/tmp/inline_payload.json || true
+                    
+                        i=$((i+1))
+                    done
                     '''
                 }
             }
