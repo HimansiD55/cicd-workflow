@@ -1,6 +1,6 @@
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Jenkinsfile — Claude AI PR Code Review Pipeline
-// Triggers on pull_request events only (open / synchronize / reopen)
 // ─────────────────────────────────────────────────────────────────────────────
 
 pipeline {
@@ -27,30 +27,41 @@ pipeline {
         )
     }
 
+    // ── Only keep credentials here. Derived values go inside stages. ──────────
     environment {
         GITHUB_TOKEN   = credentials('github-token')
         CLAUDE_API_KEY = credentials('ANTHROPIC_API_KEY')
-
-        REPO_OWNER  = "${env.CHANGE_FORK ?: env.ghprbGhRepository?.split('/')?.getAt(0) ?: ''}"
-        REPO_NAME   = "${env.GIT_URL?.tokenize('/')?.last()?.replace('.git','') ?: ''}"
-        PR_NUMBER   = "${env.CHANGE_ID ?: env.ghprbPullId ?: ''}"
-        PR_HEAD_SHA = "${env.GIT_COMMIT ?: ''}"
-        BASE_BRANCH = "${env.CHANGE_TARGET ?: 'main'}"
-        HEAD_BRANCH = "${env.CHANGE_BRANCH ?: ''}"
     }
 
     stages {
 
-        // ── Guard: skip non-PR builds (e.g. main branch direct build) ─────────
+        // ── Guard: skip non-PR builds ─────────────────────────────────────────
         stage('Validate PR Context') {
             steps {
                 script {
                     if (!env.CHANGE_ID) {
-                        echo "Not a PR build (branch: ${env.BRANCH_NAME}). Skipping pipeline."
+                        echo "Not a PR build (branch: ${env.BRANCH_NAME}). Skipping."
                         currentBuild.result = 'NOT_BUILT'
                         error("Skipping non-PR build — CHANGE_ID is not set")
                     }
-                    echo "PR #${env.CHANGE_ID} detected. Proceeding with review."
+
+                    // ── Derive all repo variables HERE, inside a real script
+                    //    context, after the agent workspace is ready ────────────
+                    def gitUrl = env.GIT_URL ?: scm.userRemoteConfigs[0].url ?: ''
+
+                    def repoSegments = gitUrl.tokenize('/')
+                    env.REPO_OWNER  = repoSegments.size() >= 2 ? repoSegments[-2] : ''
+                    env.REPO_NAME   = repoSegments.size() >= 1 ? repoSegments[-1].replace('.git', '') : ''
+                    env.REPO_PATH   = "${env.REPO_OWNER}/${env.REPO_NAME}"
+
+                    env.PR_NUMBER   = env.CHANGE_ID   ?: ''
+                    env.BASE_BRANCH = env.CHANGE_TARGET ?: 'main'
+                    env.HEAD_BRANCH = env.CHANGE_BRANCH ?: ''
+                    env.PR_HEAD_SHA = env.GIT_COMMIT  ?: ''
+
+                    echo "Repo     : ${env.REPO_PATH}"
+                    echo "PR #     : ${env.PR_NUMBER}"
+                    echo "Branches : ${env.HEAD_BRANCH} → ${env.BASE_BRANCH}"
                 }
             }
         }
@@ -59,13 +70,11 @@ pipeline {
         stage('Checkout') {
             steps {
                 script {
-                    echo "PR #${env.PR_NUMBER}: ${env.HEAD_BRANCH} → ${env.BASE_BRANCH}"
-
                     checkout([
                         $class: 'GitSCM',
                         branches: [[name: "origin/pr/${env.PR_NUMBER}/head"]],
                         userRemoteConfigs: [[
-                            url: env.GIT_URL,
+                            url: env.GIT_URL ?: scm.userRemoteConfigs[0].url,
                             refspec: "+refs/pull/${env.PR_NUMBER}/head:refs/remotes/origin/pr/${env.PR_NUMBER}/head",
                             credentialsId: 'github-token'
                         ]],
@@ -105,15 +114,12 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    def repoSegments = env.GIT_URL.tokenize('/')
-                    def repoOwner = repoSegments[-2]
-                    def repoName  = repoSegments[-1].replace('.git','')
-
                     def prMetadata = sh(
                         script: """
-                            curl -sf -H "Authorization: token ${GITHUB_TOKEN}" \
+                            curl -sf \
+                                 -H "Authorization: token ${GITHUB_TOKEN}" \
                                  -H "Accept: application/vnd.github.v3+json" \
-                                 "https://api.github.com/repos/${repoOwner}/${repoName}/pulls/${env.PR_NUMBER}" \
+                                 "https://api.github.com/repos/${env.REPO_PATH}/pulls/${env.PR_NUMBER}" \
                             | jq -r '{title: .title, body: (.body // "(no description)"), base: .base.ref, head: .head.ref}'
                         """,
                         returnStdout: true
@@ -147,6 +153,7 @@ ${changedFiles}
 ## Code Diff
 ```diff
 ${diff}
+```
 
 ## Review Instructions
 
@@ -252,7 +259,6 @@ Be specific and actionable. Do not hallucinate line numbers — only include the
                     writeFile file: '/tmp/review.json', text: reviewJson
                     echo "Claude review received (${reviewJson.size()} bytes)"
 
-                    // Write verdict to a file to avoid shell quoting issues
                     sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
                     def verdict = readFile('/tmp/verdict.txt').trim()
 
@@ -266,9 +272,6 @@ Be specific and actionable. Do not hallucinate line numbers — only include the
         stage('Post PR Comment') {
             steps {
                 script {
-                    def repoSegments = env.GIT_URL.tokenize('/')
-                    def repoPath     = "${repoSegments[-2]}/${repoSegments[-1].replace('.git','')}"
-
                     def commentBody = sh(
                         script: """
 python3 - <<'PYEOF'
@@ -335,12 +338,11 @@ PYEOF
                         returnStdout: true
                     ).trim()
 
-                    // Write comment to file to avoid shell escaping issues
                     writeFile file: '/tmp/comment_body.txt', text: commentBody
 
                     sh """
                         COMMENT_JSON=\$(python3 -c "
-import json, sys
+import json
 with open('/tmp/comment_body.txt') as f:
     body = f.read()
 print(json.dumps({'body': body}))
@@ -349,7 +351,7 @@ print(json.dumps({'body': body}))
                              -H "Authorization: token ${GITHUB_TOKEN}" \\
                              -H "Accept: application/vnd.github.v3+json" \\
                              -H "Content-Type: application/json" \\
-                             "https://api.github.com/repos/${repoPath}/issues/${env.PR_NUMBER}/comments" \\
+                             "https://api.github.com/repos/${env.REPO_PATH}/issues/${env.PR_NUMBER}/comments" \\
                              -d "\$COMMENT_JSON" \\
                         && echo "Comment posted successfully"
                     """
@@ -361,9 +363,7 @@ print(json.dumps({'body': body}))
         stage('Set PR Status') {
             steps {
                 script {
-                    def repoSegments = env.GIT_URL.tokenize('/')
-                    def repoPath     = "${repoSegments[-2]}/${repoSegments[-1].replace('.git','')}"
-                    def verdict      = env.REVIEW_VERDICT ?: 'UNKNOWN'
+                    def verdict = env.REVIEW_VERDICT ?: 'UNKNOWN'
 
                     def stateMap = [PASS: 'success', WARN: 'success', FAIL: 'failure', UNKNOWN: 'error']
                     def descMap  = [
@@ -382,7 +382,7 @@ print(json.dumps({'body': body}))
                              -H "Authorization: token ${GITHUB_TOKEN}" \\
                              -H "Accept: application/vnd.github.v3+json" \\
                              -H "Content-Type: application/json" \\
-                             "https://api.github.com/repos/${repoPath}/statuses/${env.PR_HEAD_SHA}" \\
+                             "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" \\
                              -d '{
                                "state":       "${state}",
                                "target_url":  "${buildUrl}",
@@ -399,7 +399,10 @@ print(json.dumps({'body': body}))
     // ── Post actions ──────────────────────────────────────────────────────────
     post {
         always {
-            sh 'rm -f /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/comment_body.txt /tmp/verdict.txt'
+            // ── node{} wrapper ensures workspace context is available ──────────
+            node('ec2-reviewer') {
+                sh 'rm -f /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/comment_body.txt /tmp/verdict.txt || true'
+            }
             cleanWs()
         }
 
@@ -414,9 +417,8 @@ print(json.dumps({'body': body}))
 
         failure {
             script {
-                def repoSegments = env.GIT_URL?.tokenize('/')
-                def repoPath     = repoSegments ? "${repoSegments[-2]}/${repoSegments[-1]?.replace('.git','')}" : ''
-                def sha          = env.PR_HEAD_SHA ?: ''
+                def repoPath = env.REPO_PATH ?: ''
+                def sha      = env.PR_HEAD_SHA ?: ''
                 if (repoPath && sha) {
                     sh """
                         curl -sf -X POST \\
