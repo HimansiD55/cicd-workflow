@@ -1,11 +1,8 @@
-
 pipeline {
-    agent {
-        label 'ec2-reviewer'
-    }
+    agent { label 'ec2-reviewer' }
 
     options {
-        timeout(time: 15, unit: 'MINUTES')
+        timeout(time: 20, unit: 'MINUTES')
         disableConcurrentBuilds()
         skipDefaultCheckout(true)
     }
@@ -16,360 +13,230 @@ pipeline {
     }
 
     stages {
-
         stage('Validate PR Context') {
             steps {
                 script {
                     if (!env.CHANGE_ID) {
-                        echo "Not a PR build (branch: ${env.BRANCH_NAME}). Skipping."
                         currentBuild.result = 'NOT_BUILT'
-                        error("Skipping non-PR build — CHANGE_ID is not set")
+                        error("Skipping non-PR build")
                     }
 
                     def gitUrl = env.GIT_URL ?: scm.userRemoteConfigs[0].url ?: ''
                     def repoSegments = gitUrl.tokenize('/')
-                    env.REPO_OWNER  = repoSegments.size() >= 2 ? repoSegments[-2] : ''
-                    env.REPO_NAME   = repoSegments.size() >= 1 ? repoSegments[-1].replace('.git', '') : ''
-                    env.REPO_PATH   = "${env.REPO_OWNER}/${env.REPO_NAME}"
-                    env.PR_NUMBER   = env.CHANGE_ID     ?: ''
-                    env.BASE_BRANCH = env.CHANGE_TARGET ?: 'main'
-                    env.HEAD_BRANCH = env.CHANGE_BRANCH ?: ''
-                    env.PR_HEAD_SHA = env.GIT_COMMIT    ?: ''
 
-                    echo "Repo: ${env.REPO_PATH} | PR #${env.PR_NUMBER} | ${env.HEAD_BRANCH} → ${env.BASE_BRANCH}"
+                    if (repoSegments.size() >= 2) {
+                        env.REPO_OWNER = repoSegments[-2]
+                        env.REPO_NAME  = repoSegments[-1].replace('.git', '')
+                        env.REPO_PATH  = "${env.REPO_OWNER}/${env.REPO_NAME}"
+                    } else {
+                        error("Could not parse repo from URL: ${gitUrl}")
+                    }
+
+                    env.PR_NUMBER   = env.CHANGE_ID
+                    env.BASE_BRANCH = env.CHANGE_TARGET ?: 'main'
                 }
             }
         }
 
-        stage('Checkout') {
+        stage('Checkout Full Repo') {
             steps {
                 script {
-                    checkout([
-                        $class: 'GitSCM',
+                    // Full clone — no --depth, so Claude sees the whole repo
+                    checkout([$class: 'GitSCM',
                         branches: [[name: "origin/pr/${env.PR_NUMBER}/head"]],
+                        extensions: [], // no shallow clone extension
                         userRemoteConfigs: [[
                             url: env.GIT_URL ?: scm.userRemoteConfigs[0].url,
                             refspec: "+refs/pull/${env.PR_NUMBER}/head:refs/remotes/origin/pr/${env.PR_NUMBER}/head",
                             credentialsId: 'github-token'
-                        ]],
-                        extensions: [
-                            [$class: 'CloneOption', depth: 0, noTags: true, shallow: false]
-                        ]
+                        ]]
                     ])
 
                     env.PR_HEAD_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
-                    echo "Reviewing commit: ${env.PR_HEAD_SHA}"
+
+                    // Fetch base branch fully too
+                    sh "git fetch origin ${env.BASE_BRANCH}:refs/remotes/origin/${env.BASE_BRANCH}"
                 }
             }
         }
 
-        stage('Get PR Diff') {
+        stage('Build Context Package') {
             steps {
                 script {
-                    sh "git fetch origin ${env.BASE_BRANCH}:refs/remotes/origin/${env.BASE_BRANCH} --depth=50"
-
+                    // 1. Get the diff (still needed for focus)
                     def diff = sh(
-                        script: """
-                            git diff origin/${env.BASE_BRANCH}...HEAD \
-                                -- ':!*.lock' ':!package-lock.json' ':!yarn.lock' \
-                                   ':!*.min.js' ':!*.min.css' ':!dist/' ':!build/' \
-                                2>/dev/null | head -c 80000
-                        """,
+                        script: "git diff origin/${env.BASE_BRANCH}...HEAD -- ':!*.lock' ':!package-lock.json' ':!yarn.lock'",
                         returnStdout: true
                     ).trim()
+                    writeFile file: 'pr_diff.txt', text: diff ?: "No changes"
 
-                    if (!diff) {
-                        diff = "No meaningful code changes detected (only lock files or build artifacts changed)."
-                    }
-
+                    // 2. Get list of changed files
                     def changedFiles = sh(
-                        script: "git diff --name-status origin/${env.BASE_BRANCH}...HEAD 2>/dev/null | head -100",
+                        script: "git diff --name-only origin/${env.BASE_BRANCH}...HEAD -- ':!*.lock' ':!package-lock.json' ':!yarn.lock'",
                         returnStdout: true
-                    ).trim()
+                    ).trim().split('\n').findAll { it }
 
-                    def prMetadata = sh(
-                        script: """
-                            curl -sf \
-                                 -H "Authorization: token ${GITHUB_TOKEN}" \
-                                 -H "Accept: application/vnd.github.v3+json" \
-                                 "https://api.github.com/repos/${env.REPO_PATH}/pulls/${env.PR_NUMBER}" \
-                            | jq -r '{title: .title, body: (.body // "(no description)"), base: .base.ref, head: .head.ref}'
-                        """,
-                        returnStdout: true
-                    ).trim()
+                    // 3. For each changed file, collect its FULL current content
+                    def fullFileContents = new StringBuilder()
+                    fullFileContents.append("=== FULL CONTENTS OF CHANGED FILES ===\n\n")
 
-                    writeFile file: '/tmp/pr_diff.txt',  text: diff
-                    writeFile file: '/tmp/pr_files.txt', text: changedFiles
-                    writeFile file: '/tmp/pr_meta.json', text: prMetadata
+                    changedFiles.each { filePath ->
+                        if (fileExists(filePath)) {
+                            def content = readFile(filePath)
+                            // Cap each file at 30k chars to avoid token overflow
+                            if (content.length() > 30000) {
+                                content = content.take(30000) + "\n... [truncated] ..."
+                            }
+                            fullFileContents.append("--- FILE: ${filePath} ---\n")
+                            fullFileContents.append(content)
+                            fullFileContents.append("\n\n")
+                        }
+                    }
 
-                    echo "Diff size: ${diff.size()} bytes | Files:\n${changedFiles}"
+                    // 4. Find related files (files that import/reference the changed files)
+                    def relatedContents = new StringBuilder()
+                    relatedContents.append("=== RELATED FILES (import/reference changed files) ===\n\n")
+
+                    changedFiles.each { changedFile ->
+                        def baseName = changedFile.tokenize('/')[-1].replace('.js','').replace('.ts','').replace('.py','')
+                        // Search repo for files that import/reference this file
+                        def relatedFiles = sh(
+                            script: """grep -rl "${baseName}" --include="*.js" --include="*.ts" --include="*.py" --include="*.java" . 2>/dev/null | grep -v node_modules | grep -v ".git" | head -5 || true""",
+                            returnStdout: true
+                        ).trim().split('\n').findAll { it && !changedFiles.contains(it.replace('./','')) }
+
+                        relatedFiles.each { relPath ->
+                            if (fileExists(relPath)) {
+                                def content = readFile(relPath)
+                                if (content.length() > 15000) content = content.take(15000) + "\n... [truncated] ..."
+                                relatedContents.append("--- RELATED FILE: ${relPath} (references ${baseName}) ---\n")
+                                relatedContents.append(content)
+                                relatedContents.append("\n\n")
+                            }
+                        }
+                    }
+
+                    // 5. Write the full context package
+                    writeFile file: 'full_context.txt', text: fullFileContents.toString() + relatedContents.toString()
+
+                    // Save changed files list for prompt
+                    env.CHANGED_FILES_LIST = changedFiles.join(', ')
                 }
             }
         }
 
-        stage('Claude AI Review') {
+        stage('Claude Review') {
             steps {
                 script {
-                    def diff         = readFile('/tmp/pr_diff.txt').trim()
-                    def changedFiles = readFile('/tmp/pr_files.txt').trim()
-                    def prMeta       = readFile('/tmp/pr_meta.json').trim()
+                    def diffText      = readFile('pr_diff.txt')
+                    def fullContext   = readFile('full_context.txt')
 
-                    writeFile file: '/tmp/prompt.txt', text: """You are a senior software engineer performing a thorough code review of a GitHub Pull Request.
+                    // Cap total prompt size (~100k chars safe limit)
+                    def totalContext = fullContext.length() > 80000 ? fullContext.take(80000) + "\n...[context truncated]..." : fullContext
 
-## PR Metadata
-${prMeta}
+                    def prompt = """You are a senior code reviewer with full access to the repository.
 
-## Changed Files
-${changedFiles}
+CHANGED FILES IN THIS PR: ${env.CHANGED_FILES_LIST}
 
-## Code Diff
-<diff>
-${diff}
-</diff>
+=== GIT DIFF (what changed) ===
+${diffText}
 
-## Review Instructions
+${totalContext}
 
-Analyze the diff carefully. For each issue include the file name and line number where possible.
+Your job:
+1. Review the diff carefully
+2. Use the full file contents and related files to trace root causes — not just surface issues
+3. Identify bugs, security issues, logic errors, and bad patterns
+4. For each issue, specify the exact file and line number
 
-1. Security Vulnerabilities - SQL injection, XSS, CSRF, insecure deserialization, improper auth, SSRF, OWASP Top 10
-2. Secrets and Credential Leaks (CRITICAL) - Hardcoded API keys, tokens, passwords, private keys, base64 encoded secrets
-3. Logic Bugs and Correctness - Off-by-one errors, null dereferences, race conditions, unhandled edge cases
-4. Dependency Issues - Vulnerable package versions, missing pinning
-5. Code Quality and Best Practices - DRY violations, missing input validation, poor naming, functions over 50 lines
-6. Performance Issues - N+1 queries, missing pagination, inefficient algorithms
-
-## Output Format
-
-Respond with valid JSON only. No markdown, no preamble, nothing outside the JSON object:
-
+Return ONLY a JSON object with this structure (no markdown fences):
 {
-  "summary": "One paragraph overall assessment.",
-  "verdict": "PASS",
-  "verdict_reason": "One sentence explaining the verdict.",
-  "critical_issues": [],
-  "warnings": [],
-  "suggestions": [],
-  "positive_notes": []
+  "verdict": "PASS" or "FAIL",
+  "summary": "2-3 sentence overall summary",
+  "issues": [
+    {
+      "file": "path/to/file.js",
+      "line": 42,
+      "severity": "critical|high|medium|low",
+      "title": "Short issue title",
+      "detail": "Full explanation including root cause if cross-file"
+    }
+  ]
 }
+If no issues found, return an empty issues array and verdict PASS."""
 
-verdict must be PASS, WARN, or FAIL.
-FAIL = any critical issue. WARN = warnings but no blockers. PASS = only suggestions or positives.
-Each issue object must have: category, file, line (use ? if unknown), issue, recommendation"""
+                    writeFile file: 'prompt.txt', text: prompt
 
+                    withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CL_KEY')]) {
+                        sh '''
+                            export ANTHROPIC_API_KEY=$CL_KEY
+                            claude -p "$(cat prompt.txt)" --output-format json \
+                                | jq -r '.result' \
+                                | sed 's/```json//g' | sed 's/```//g' \
+                                > review.json
+                        '''
+                    }
+
+                    env.REVIEW_VERDICT = sh(script: "jq -r '.verdict // \"UNKNOWN\"' review.json", returnStdout: true).trim()
+                }
+            }
+        }
+
+        stage('Post to GitHub') {
+            steps {
+                withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
                     sh '''
-python3 - <<'PYEOF'
-import json
+                        # Build main PR comment with summary + issue table
+                        VERDICT=$(jq -r '.verdict' review.json)
+                        SUMMARY=$(jq -r '.summary' review.json)
+                        ISSUE_COUNT=$(jq '.issues | length' review.json)
 
-with open('/tmp/prompt.txt', 'r') as f:
-    prompt_text = f.read()
+                        ICON="✅"
+                        if [ "$VERDICT" = "FAIL" ]; then ICON="❌"; fi
 
-payload = {
-    "model": "claude-sonnet-4-5",
-    "max_tokens": 4096,
-    "system": "You are a code review assistant. Always respond with pure valid JSON only. Never use markdown code fences. Never add any text before or after the JSON object.",
-    "messages": [{"role": "user", "content": prompt_text}]
-}
+                        # Build issues table rows
+                        ISSUES_TABLE=$(jq -r '
+                            .issues[] |
+                            "| " + .severity + " | `" + .file + "` L" + (.line|tostring) + " | **" + .title + "** — " + .detail + " |"
+                        ' review.json || echo "")
 
-with open('/tmp/claude_request.json', 'w') as f:
-    json.dump(payload, f)
+                        # Compose comment body
+                        BODY=$(jq -n \
+                            --arg icon "$ICON" \
+                            --arg verdict "$VERDICT" \
+                            --arg summary "$SUMMARY" \
+                            --arg count "$ISSUE_COUNT" \
+                            --arg table "$ISSUES_TABLE" \
+                            '{body: ($icon + " ## Claude AI Review: " + $verdict + "\n\n**Summary:** " + $summary + "\n\n**Issues found:** " + $count + "\n\n| Severity | Location | Detail |\n|---|---|---|\n" + $table)}')
 
-print("Request JSON written successfully")
-PYEOF
-'''
+                        curl -sf -X POST \
+                             -H "Authorization: token $TKN" \
+                             -H "Content-Type: application/json" \
+                             "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
+                             -d "$BODY"
 
-                    withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CLAUDE_KEY')]) {
-                        sh '''
-                            HTTP_STATUS=$(curl -s -o /tmp/claude_response.json -w "%{http_code}" \
-                                -X POST "https://api.anthropic.com/v1/messages" \
-                                -H "x-api-key: ${CLAUDE_KEY}" \
-                                -H "anthropic-version: 2023-06-01" \
-                                -H "content-type: application/json" \
-                                --data @/tmp/claude_request.json \
-                                --max-time 90)
+                        # Also post inline review comments for each issue (GitHub Review API)
+                        jq -c '.issues[]' review.json | while read issue; do
+                            FILE=$(echo $issue | jq -r '.file')
+                            LINE=$(echo $issue | jq -r '.line')
+                            TITLE=$(echo $issue | jq -r '.title')
+                            DETAIL=$(echo $issue | jq -r '.detail')
+                            SEV=$(echo $issue | jq -r '.severity')
 
-                            echo "HTTP Status: ${HTTP_STATUS}"
-                            cat /tmp/claude_response.json
+                            INLINE_BODY=$(jq -n \
+                                --arg body "**[$SEV] $TITLE**\n\n$DETAIL" \
+                                --arg path "$FILE" \
+                                --arg sha "${PR_HEAD_SHA}" \
+                                --argjson line "$LINE" \
+                                '{commit_id: $sha, path: $path, line: $line, side: "RIGHT", body: $body}')
 
-                            if [ "$HTTP_STATUS" != "200" ]; then
-                                echo "ERROR: Anthropic API returned HTTP ${HTTP_STATUS}"
-                                exit 1
-                            fi
-                        '''
-                    }
-
-                    def reviewJson = sh(
-                        script: """
-                            jq -r '.content[0].text // empty' /tmp/claude_response.json \
-                            | sed 's/^```json//' \
-                            | sed 's/^```//' \
-                            | tr -d '\\r' \
-                            | awk 'NF' \
-                            > /tmp/review.json
-                            cat /tmp/review.json
-                        """,
-                        returnStdout: false
-                    )
-
-                    def reviewContent = readFile('/tmp/review.json').trim()
-
-                   
-                    echo "Claude review received (${reviewContent.size()} bytes)"
-
-                    sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
-                    env.REVIEW_VERDICT = readFile('/tmp/verdict.txt').trim()
-                    echo "Verdict: ${env.REVIEW_VERDICT}"
-
-                    if (!reviewJson) {
-                        error("Claude API returned no content")
-                    }
-
-                    writeFile file: '/tmp/review.json', text: reviewJson
-                    echo "Claude review received (${reviewJson.size()} bytes)"
-
-                    sh "jq -r '.verdict // \"UNKNOWN\"' /tmp/review.json > /tmp/verdict.txt 2>/dev/null || echo 'UNKNOWN' > /tmp/verdict.txt"
-                    env.REVIEW_VERDICT = readFile('/tmp/verdict.txt').trim()
-                    echo "Verdict: ${env.REVIEW_VERDICT}"
-                }
-            }
-        }
-
-        stage('Post PR Comment') {
-            steps {
-                script {
-                    def commentBody = sh(
-                        script: """
-sh '''
-python3 - <<'PYEOF'
-import json
-
-with open('/tmp/prompt.txt', 'r') as f:
-    prompt_text = f.read()
-
-payload = {
-    "model": "claude-sonnet-4-5",
-    "max_tokens": 4096,
-    "system": "You are a code review assistant. Always respond with pure valid JSON only. Never use markdown code fences. Never add any text before or after the JSON object.",
-    "messages": [{"role": "user", "content": prompt_text}]
-}
-
-with open('/tmp/claude_request.json', 'w') as f:
-    json.dump(payload, f)
-
-print("Request JSON written successfully")
-PYEOF
-'''
-
-verdict = data.get('verdict', 'UNKNOWN')
-emoji_map = {'PASS': '\\u2705', 'WARN': '\\u26a0\\ufe0f', 'FAIL': '\\u274c'}
-emoji = emoji_map.get(verdict, '\\U0001f50d')
-
-lines = []
-lines.append(f"## {emoji} Claude AI Code Review - {verdict}")
-lines.append("")
-lines.append(f"**{data.get('verdict_reason', '')}**")
-lines.append("")
-lines.append("### Summary")
-lines.append(data.get('summary', ''))
-lines.append("")
-
-critical = data.get('critical_issues', [])
-if critical:
-    lines.append("---")
-    lines.append("### Critical Issues (must fix before merge)")
-    for i, issue in enumerate(critical, 1):
-        lines.append(f"**{i}. [{issue.get('category','')}] {issue.get('file','')}:{issue.get('line','?')}**")
-        lines.append(f"> {issue.get('issue','')}")
-        lines.append(f"Fix: {issue.get('recommendation','')}")
-        lines.append("")
-
-warnings = data.get('warnings', [])
-if warnings:
-    lines.append("---")
-    lines.append("### Warnings (should fix)")
-    for i, w in enumerate(warnings, 1):
-        lines.append(f"**{i}. [{w.get('category','')}] {w.get('file','')}:{w.get('line','?')}**")
-        lines.append(f"> {w.get('issue','')}")
-        lines.append(f"{w.get('recommendation','')}")
-        lines.append("")
-
-suggestions = data.get('suggestions', [])
-if suggestions:
-    lines.append("---")
-    lines.append("### Suggestions (nice to have)")
-    for s in suggestions:
-        lines.append(f"- [{s.get('category','')}] {s.get('file','')}: {s.get('issue','')} - {s.get('recommendation','')}")
-    lines.append("")
-
-positives = data.get('positive_notes', [])
-if positives:
-    lines.append("---")
-    lines.append("### What is done well")
-    for p in positives:
-        lines.append(f"- {p}")
-    lines.append("")
-
-lines.append("---")
-lines.append("*Reviewed by Claude AI via Jenkins pipeline. Human review is still required.*")
-
-print('\\n'.join(lines))
-PYEOF
-                        """,
-                        returnStdout: true
-                    ).trim()
-
-                    writeFile file: '/tmp/comment_body.txt', text: commentBody
-
-                    withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        sh '''
-                            COMMENT_JSON=$(python3 -c "
-import json
-with open('/tmp/comment_body.txt') as f:
-    body = f.read()
-print(json.dumps({'body': body}))
-")
                             curl -sf -X POST \
-                                 -H "Authorization: token ${GH_TOKEN}" \
-                                 -H "Accept: application/vnd.github.v3+json" \
+                                 -H "Authorization: token $TKN" \
                                  -H "Content-Type: application/json" \
-                                 "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
-                                 -d "${COMMENT_JSON}" \
-                            && echo "Comment posted successfully"
-                        '''
-                    }
-                }
-            }
-        }
-
-        stage('Set PR Status') {
-            steps {
-                script {
-                    def verdict     = env.REVIEW_VERDICT ?: 'UNKNOWN'
-                    def stateMap    = [PASS: 'success', WARN: 'success', FAIL: 'failure', UNKNOWN: 'error']
-                    def descMap     = [
-                        PASS:    'Claude AI review passed — no critical issues found',
-                        WARN:    'Claude AI review: warnings found, review recommended',
-                        FAIL:    'Claude AI review FAILED — critical issues must be resolved',
-                        UNKNOWN: 'Claude AI review error — check Jenkins logs'
-                    ]
-                    def state       = stateMap[verdict] ?: 'error'
-                    def description = descMap[verdict]  ?: 'Review status unknown'
-
-                    withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        sh """
-                            curl -sf -X POST \
-                                 -H "Authorization: token ${GH_TOKEN}" \
-                                 -H "Accept: application/vnd.github.v3+json" \
-                                 -H "Content-Type: application/json" \
-                                 "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" \
-                                 -d '{
-                                   "state":       "${state}",
-                                   "target_url":  "${env.BUILD_URL}",
-                                   "description": "${description}",
-                                   "context":     "claude-ai-review"
-                                 }' \
-                            && echo "Status set to: ${state}"
-                        """
-                    }
+                                 "https://api.github.com/repos/${REPO_PATH}/pulls/${PR_NUMBER}/comments" \
+                                 -d "$INLINE_BODY" || true  # don't fail if line doesn't exist in diff
+                        done
+                    '''
                 }
             }
         }
@@ -377,34 +244,19 @@ print(json.dumps({'body': body}))
 
     post {
         always {
-            sh 'rm -f /tmp/prompt.txt /tmp/claude_request.json /tmp/claude_response.json /tmp/pr_diff.txt /tmp/pr_files.txt /tmp/pr_meta.json /tmp/review.json /tmp/comment_body.txt /tmp/verdict.txt || true'
-            cleanWs()
-        }
-
-        success {
             script {
-                if ((env.REVIEW_VERDICT ?: 'UNKNOWN') == 'FAIL') {
-                    currentBuild.result = 'UNSTABLE'
-                }
-            }
-        }
-
-        failure {
-            script {
-                def repoPath = env.REPO_PATH ?: ''
-                def sha      = env.PR_HEAD_SHA ?: ''
-                if (repoPath && sha) {
-                    withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
+                if (env.REPO_PATH && env.PR_HEAD_SHA) {
+                    def state = (env.REVIEW_VERDICT == 'PASS') ? 'success' : 'failure'
+                    withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
                         sh """
-                            curl -sf -X POST \
-                                 -H "Authorization: token ${GH_TOKEN}" \
-                                 -H "Accept: application/vnd.github.v3+json" \
-                                 "https://api.github.com/repos/${repoPath}/statuses/${sha}" \
-                                 -d '{"state":"error","description":"Jenkins pipeline error","context":"claude-ai-review"}' || true
+                            curl -sf -X POST -H "Authorization: token \$TKN" \
+                            -d '{"state":"${state}","context":"claude-ai-review","description":"Review Verdict: ${env.REVIEW_VERDICT}"}' \
+                            "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" || true
                         """
                     }
                 }
             }
+            cleanWs()
         }
     }
 }
