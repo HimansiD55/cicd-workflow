@@ -258,72 +258,90 @@ If no real issues found, return empty issues array with verdict PASS."""
                 }
             }
         }
-
-        stage('Post to GitHub') {
+        
+                stage('Post to GitHub') {
             steps {
+                script {
+                    // Write the post script to a file — avoids ALL Groovy/shell quoting conflicts
+                    writeFile file: 'post_github.sh', text: '''#!/bin/bash
+        set -e
+        
+        VERDICT=$(jq -r ".verdict" review.json)
+        SUMMARY=$(jq -r ".summary" review.json)
+        ISSUE_COUNT=$(jq ".issues | length" review.json)
+        ICON="✅"
+        [ "$VERDICT" = "FAIL" ] && ICON="❌"
+        
+        STATS=$(jq -r '
+            .agent_stats // {} |
+            to_entries |
+            map(.key + ": " + (.value|tostring)) |
+            join("  |  ")
+        ' review.json 2>/dev/null || echo "")
+        
+        ISSUES_TABLE=$(jq -r '
+            .issues[] |
+            "| " + .severity +
+            " | " + .file + " L" + (.line|tostring) +
+            " | " + .category +
+            " | " + .title + " — " + .detail + " |"
+        ' review.json 2>/dev/null || echo "")
+        
+        BODY="${ICON} ## Claude AI Review (multi-agent): ${VERDICT}
+        
+        **Summary:** ${SUMMARY}
+        
+        **Issues found:** ${ISSUE_COUNT}  |  ${STATS}
+        
+        | Severity | Location | Category | Detail |
+        |---|---|---|---|
+        ${ISSUES_TABLE}
+        
+        > Reviewed by ${AGENT_CLASSES} agents in parallel, verified and deduplicated."
+        
+        jq -n --arg b "$BODY" '{"body": $b}' > pr_comment.json
+        
+        curl -sf -X POST \
+             -H "Authorization: token ${TKN}" \
+             -H "Content-Type: application/json" \
+             "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
+             -d @pr_comment.json
+        
+        echo "PR comment posted."
+        
+        # Batch-extract all issue fields in one jq call, POST inline comments in parallel
+        jq -r '
+            .issues[] |
+            [.severity, .category, .title, .detail, .file, (.line|tostring)] |
+            @tsv
+        ' review.json > /tmp/issues.tsv 2>/dev/null || true
+        
+        while IFS=$(printf "\t") read -r severity category title detail filePath lineNum; do
+            echo "$lineNum" | grep -qE "^[0-9]+$" || continue
+        
+            COMMENT_BODY="[${severity}] [${category}] ${title}
+        
+        ${detail}"
+        
+            jq -n \
+                --arg body    "$COMMENT_BODY" \
+                --arg path    "$filePath" \
+                --arg sha     "$PR_HEAD_SHA" \
+                --argjson line "$lineNum" \
+                '{"commit_id":$sha,"path":$path,"line":$line,"side":"RIGHT","body":$body}' \
+            | curl -sf -X POST \
+                   -H "Authorization: token ${TKN}" \
+                   -H "Content-Type: application/json" \
+                   "https://api.github.com/repos/${REPO_PATH}/pulls/${PR_NUMBER}/comments" \
+                   -d @- &
+        
+        done < /tmp/issues.tsv
+        wait
+        echo "Inline comments posted."
+        '''
+                }
                 withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
-                    sh '''
-                        VERDICT=$(jq -r ".verdict" review.json)
-                        SUMMARY=$(jq -r ".summary" review.json)
-                        ISSUE_COUNT=$(jq ".issues | length" review.json)
-                        ICON="✅"; [ "$VERDICT" = "FAIL" ] && ICON="❌"
-
-                        STATS=$(jq -r "
-                            .agent_stats // {} |
-                            to_entries |
-                            map(.key + \": \" + (.value|tostring)) |
-                            join(\"  |  \")
-                        " review.json 2>/dev/null || echo "")
-
-                        ISSUES_TABLE=$(jq -r "
-                            .issues[] |
-                            \"| \" + .severity +
-                            \" | \" + .file + \" L\" + (.line|tostring) +
-                            \" | \" + .category +
-                            \" | \" + .title + \" — \" + .detail + \" |\"
-                        " review.json 2>/dev/null || echo "")
-
-                        jq -n --arg b "${ICON} ## Claude AI Review (multi-agent): ${VERDICT}
-
-**Summary:** ${SUMMARY}
-
-**Issues found:** ${ISSUE_COUNT}  |  ${STATS}
-
-| Severity | Location | Category | Detail |
-|---|---|---|---|
-${ISSUES_TABLE}
-
-> Reviewed by ${AGENT_CLASSES} agents in parallel, verified and deduplicated." \
-                            "{body: \$b}" > pr_comment.json
-
-                        curl -sf -X POST \
-                             -H "Authorization: token $TKN" \
-                             -H "Content-Type: application/json" \
-                             "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
-                             -d @pr_comment.json
-
-                        # Batch-extract all issue fields in one jq call, POST in parallel
-                        jq -r ".issues[] | [.severity, .category, .title, .detail, .file, (.line|tostring)] | @tsv" \
-                            review.json > /tmp/issues.tsv 2>/dev/null || true
-
-                        while IFS=$(printf "\\t") read -r severity category title detail filePath lineNum; do
-                            echo "$lineNum" | grep -qE "^[0-9]+$" || continue
-                            jq -n \
-                                --arg body "[${severity}] [${category}] ${title}
-
-${detail}" \
-                                --arg path "$filePath" \
-                                --arg sha  "$PR_HEAD_SHA" \
-                                --argjson line "$lineNum" \
-                                "{commit_id:\$sha, path:\$path, line:\$line, side:\"RIGHT\", body:\$body}" \
-                            | curl -sf -X POST \
-                                   -H "Authorization: token $TKN" \
-                                   -H "Content-Type: application/json" \
-                                   "https://api.github.com/repos/${REPO_PATH}/pulls/${PR_NUMBER}/comments" \
-                                   -d @- &
-                        done < /tmp/issues.tsv
-                        wait
-                    '''
+                    sh 'bash post_github.sh'
                 }
             }
         }
