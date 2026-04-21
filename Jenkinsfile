@@ -8,10 +8,9 @@ pipeline {
     }
 
     environment {
-        GITHUB_TOKEN   = credentials('github-token')
-        CLAUDE_API_KEY = credentials('ANTHROPIC_API_KEY')
-        // Agent specializations — each targets a distinct issue class
-        AGENT_CLASSES  = 'security,logic,style,performance,documentation'
+        // NOTE: GITHUB_TOKEN and CLAUDE_API_KEY removed from here —
+        // they were dead declarations; all credential usage is via withCredentials blocks.
+        AGENT_CLASSES = 'security,logic,style,performance,documentation'
     }
 
     stages {
@@ -23,9 +22,9 @@ pipeline {
                         currentBuild.result = 'NOT_BUILT'
                         error("Skipping non-PR build")
                     }
-                    def segs = (env.GIT_URL ?: scm.userRemoteConfigs[0].url ?: '').tokenize('/')
-                    if (segs.size() < 2) error("Cannot parse repo from URL")
-                    env.REPO_PATH   = "${segs[-2]}/${segs[-1].replace('.git', '')}"
+                    def urlSegments = (env.GIT_URL ?: scm.userRemoteConfigs[0].url ?: '').tokenize('/')
+                    if (urlSegments.size() < 2) error("Cannot parse repo from URL")
+                    env.REPO_PATH   = "${urlSegments[-2]}/${urlSegments[-1].replace('.git', '')}"
                     env.PR_NUMBER   = env.CHANGE_ID
                     env.BASE_BRANCH = env.CHANGE_TARGET ?: 'main'
                     env.PR_HEAD_SHA = ''
@@ -46,7 +45,8 @@ pipeline {
                         ]]
                     ])
                     env.PR_HEAD_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
-                    sh "git fetch origin ${env.BASE_BRANCH}:refs/remotes/origin/${env.BASE_BRANCH}"
+                    // FIX: restore --depth=50 to avoid fetching full branch history
+                    sh "git fetch origin ${env.BASE_BRANCH}:refs/remotes/origin/${env.BASE_BRANCH} --depth=50"
                 }
             }
         }
@@ -66,14 +66,18 @@ pipeline {
                     ).trim().split('\n').findAll { it }
                     env.CHANGED_FILES_LIST = changedFiles.join(', ')
 
-                    def context = new StringBuilder("=== FULL CONTENTS OF CHANGED FILES ===\n\n")
-                    changedFiles.each { f ->
-                        if (fileExists(f)) {
-                            def c = readFile(f)
-                            context.append("--- FILE: ${f} ---\n${c.size() > 30000 ? c.take(30000) + '\n...[truncated]' : c}\n\n")
+                    def contextBuilder = new StringBuilder("=== FULL CONTENTS OF CHANGED FILES ===\n\n")
+                    changedFiles.each { filePath ->
+                        if (fileExists(filePath)) {
+                            def fileContent = readFile(filePath)
+                            contextBuilder.append("--- FILE: ${filePath} ---\n${fileContent.size() > 30000 ? fileContent.take(30000) + '\n...[truncated]' : fileContent}\n\n")
                         }
                     }
-                    writeFile file: 'full_context.txt', text: context.toString()
+                    writeFile file: 'full_context.txt', text: contextBuilder.toString()
+
+                    // FIX: read shared context once here so parallel agents don't each re-read from disk
+                    env.SHARED_DIFF    = readFile('pr_diff.txt')
+                    env.SHARED_CONTEXT = readFile('full_context.txt')
                 }
             }
         }
@@ -89,7 +93,8 @@ pipeline {
                         script { runAgent('security',
                             """Focus ONLY on security issues: injection flaws, insecure deserialization,
 hardcoded secrets, improper auth, dangerous eval/exec usage, path traversal,
-unvalidated input, XSS, CSRF, and dependency vulnerabilities."""
+unvalidated input, XSS, CSRF, and dependency vulnerabilities.""",
+                            env.SHARED_DIFF, env.SHARED_CONTEXT
                         )}
                     }
                 }
@@ -99,7 +104,8 @@ unvalidated input, XSS, CSRF, and dependency vulnerabilities."""
                         script { runAgent('logic',
                             """Focus ONLY on logic and correctness: off-by-one errors, null pointer risks,
 race conditions, incorrect algorithms, unreachable code, infinite loops,
-wrong operator precedence, missing error handling, and incorrect type coercion."""
+wrong operator precedence, missing error handling, and incorrect type coercion.""",
+                            env.SHARED_DIFF, env.SHARED_CONTEXT
                         )}
                     }
                 }
@@ -109,7 +115,8 @@ wrong operator precedence, missing error handling, and incorrect type coercion."
                         script { runAgent('style',
                             """Focus ONLY on code style and maintainability: naming conventions,
 function length, cyclomatic complexity, dead code, duplicated logic,
-poor abstractions, missing comments on non-obvious code, and test coverage gaps."""
+poor abstractions, missing comments on non-obvious code, and test coverage gaps.""",
+                            env.SHARED_DIFF, env.SHARED_CONTEXT
                         )}
                     }
                 }
@@ -119,7 +126,8 @@ poor abstractions, missing comments on non-obvious code, and test coverage gaps.
                         script { runAgent('performance',
                             """Focus ONLY on performance: N+1 queries, missing indexes hinted by ORM calls,
 unnecessary allocations in hot paths, blocking I/O on async threads,
-inefficient data structures, and missing caching opportunities."""
+inefficient data structures, and missing caching opportunities.""",
+                            env.SHARED_DIFF, env.SHARED_CONTEXT
                         )}
                     }
                 }
@@ -129,7 +137,8 @@ inefficient data structures, and missing caching opportunities."""
                         script { runAgent('documentation',
                             """Focus ONLY on documentation quality: missing or misleading docstrings,
 outdated comments that contradict the code, undocumented public APIs,
-missing changelog entries, and README gaps for new env vars or config keys."""
+missing changelog entries, and README gaps for new env vars or config keys.""",
+                            env.SHARED_DIFF, env.SHARED_CONTEXT
                         )}
                     }
                 }
@@ -142,20 +151,30 @@ missing changelog entries, and README gaps for new env vars or config keys."""
         stage('Verification + Dedup') {
             steps {
                 script {
-                    // Merge all agent outputs into one candidates file
+                    // FIX: use AGENT_CLASSES env var instead of hardcoded list
+                    def agentClasses = env.AGENT_CLASSES.tokenize(',')
+
+                    // Check if any agent produced a fallback sentinel — means API failure
+                    def fallbackAgents = agentClasses.findAll { cls ->
+                        fileExists("agent_${cls}_fallback.flag")
+                    }
+                    if (fallbackAgents) {
+                        unstable("WARNING: agents ${fallbackAgents.join(', ')} failed and returned empty results — review may be incomplete")
+                    }
+
                     def candidates = new StringBuilder("=== RAW CANDIDATES FROM ALL AGENTS ===\n\n")
-                    ['security','logic','style','performance','documentation'].each { cls ->
-                        def f = "agent_${cls}.json"
-                        if (fileExists(f)) {
+                    agentClasses.each { cls ->
+                        def agentFile = "agent_${cls}.json"
+                        if (fileExists(agentFile)) {
                             candidates.append("--- ${cls.toUpperCase()} AGENT ---\n")
-                            candidates.append(readFile(f))
+                            candidates.append(readFile(agentFile))
                             candidates.append("\n\n")
                         }
                     }
                     writeFile file: 'candidates.txt', text: candidates.toString()
 
                     def verifyPrompt = """You are a senior verification engineer. You have received candidate issues
-from ${env.AGENT_CLASSES.split(',').size()} specialized review agents.
+from ${agentClasses.size()} specialized review agents.
 
 Your job:
 1. Read each candidate issue carefully.
@@ -170,14 +189,16 @@ Your job:
 CHANGED FILES: ${env.CHANGED_FILES_LIST}
 
 === GIT DIFF ===
-${readFile('pr_diff.txt')}
+${env.SHARED_DIFF}
 
-${readFile('full_context.txt')}
+${env.SHARED_CONTEXT}
 
 === CANDIDATE ISSUES FROM ALL AGENTS ===
 ${readFile('candidates.txt')}
 
-Return ONLY a JSON object, no markdown fences:
+Return ONLY a JSON object. No explanation, no summary text, no markdown fences.
+Start your response with { and end with }.
+
 {
   "verdict": "PASS or FAIL",
   "summary": "2-3 sentence summary of the overall PR quality",
@@ -194,18 +215,37 @@ Return ONLY a JSON object, no markdown fences:
     }
   ]
 }
+
 Verdict is FAIL only if there is at least one critical or high severity issue remaining after verification.
 If no real issues found, return empty issues array with verdict PASS."""
 
                     writeFile file: 'verify_prompt.txt', text: verifyPrompt
 
                     withCredentials([string(credentialsId: 'ANTHROPIC_API_KEY', variable: 'CL_KEY')]) {
+                        // FIX: robust JSON extraction — handles prose + fenced code blocks
                         sh '''
                             export ANTHROPIC_API_KEY=$CL_KEY
                             claude -p "$(cat verify_prompt.txt)" --output-format json > verify_raw.json 2>&1 || true
+
                             jq -r '.result // empty' verify_raw.json \
-                                | sed 's/^```json//; s/^```//; s/```$//' > review.json
-                            jq empty review.json || (echo "Verifier returned invalid JSON:" && cat verify_raw.json && exit 1)
+                                | python3 -c "
+import sys, re
+text = sys.stdin.read()
+# First try: fenced JSON block
+match = re.search(r'\`\`\`json\s*(\{.*?\})\s*\`\`\`', text, re.DOTALL)
+if match:
+    print(match.group(1))
+    sys.exit(0)
+# Second try: first { to last }
+start = text.find('{')
+end   = text.rfind('}')
+if start != -1 and end != -1:
+    print(text[start:end+1])
+    sys.exit(0)
+print(text.strip())
+" > review.json
+
+                            jq empty review.json || (echo 'Verifier returned invalid JSON:' && cat verify_raw.json && exit 1)
                         '''
                     }
 
@@ -213,6 +253,13 @@ If no real issues found, return empty issues array with verdict PASS."""
                         script: 'jq -r \'.verdict // "UNKNOWN"\' review.json',
                         returnStdout: true
                     ).trim()
+
+                    // FIX: sanitize verdict — whitelist before it ever touches a shell string
+                    def rawVerdict  = env.REVIEW_VERDICT ?: 'UNKNOWN'
+                    env.SAFE_VERDICT  = (rawVerdict in ['PASS', 'FAIL']) ? rawVerdict : 'UNKNOWN'
+                    env.COMMIT_STATE  = (env.SAFE_VERDICT == 'PASS') ? 'success'
+                                      : (env.SAFE_VERDICT == 'FAIL') ? 'failure'
+                                      : 'error'
                 }
             }
         }
@@ -226,7 +273,6 @@ If no real issues found, return empty issues array with verdict PASS."""
                         ISSUE_COUNT=$(jq '.issues | length' review.json)
                         ICON="✅"; [ "$VERDICT" = "FAIL" ] && ICON="❌"
 
-                        # Build per-category stats line
                         STATS=$(jq -r '
                             .agent_stats // {} |
                             to_entries |
@@ -261,29 +307,29 @@ $ISSUES_TABLE
                              "https://api.github.com/repos/${REPO_PATH}/issues/${PR_NUMBER}/comments" \
                              -d @pr_comment.json
 
-                        # Inline comments per verified issue
-                        i=0
-                        while [ $i -lt $ISSUE_COUNT ]; do
-                            jq -c ".issues[$i]" review.json > /tmp/issue.json
-                            LINE=$(jq -r '.line' /tmp/issue.json)
-                            echo "$LINE" | grep -qE '^[0-9]+$' || { i=$((i+1)); continue; }
+                        # FIX: batch-extract all issue fields in one jq call, then post in parallel
+                        jq -r '.issues[] | [.severity, .category, .title, .detail, .file, (.line|tostring)] | @tsv' \
+                            review.json > /tmp/issues.tsv 2>/dev/null || true
+
+                        while IFS=$'\t' read -r severity category title detail filePath lineNum; do
+                            echo "$lineNum" | grep -qE '^[0-9]+$' || continue
 
                             jq -n \
-                                --arg body "[$(jq -r '.severity' /tmp/issue.json | tr '[:lower:]' '[:upper:]')] [$(jq -r '.category' /tmp/issue.json)] $(jq -r '.title' /tmp/issue.json)
+                                --arg body "[${severity^^}] [${category}] ${title}
 
-$(jq -r '.detail' /tmp/issue.json)" \
-                                --arg path "$(jq -r '.file' /tmp/issue.json)" \
-                                --arg sha "${PR_HEAD_SHA}" \
-                                --argjson line "$LINE" \
+${detail}" \
+                                --arg path "$filePath" \
+                                --arg sha  "$PR_HEAD_SHA" \
+                                --argjson line "$lineNum" \
                                 '{commit_id:$sha, path:$path, line:$line, side:"RIGHT", body:$body}' \
                             | curl -sf -X POST \
                                    -H "Authorization: token $TKN" \
                                    -H "Content-Type: application/json" \
                                    "https://api.github.com/repos/${REPO_PATH}/pulls/${PR_NUMBER}/comments" \
-                                   -d @- || true
+                                   -d @- &
 
-                            i=$((i+1))
-                        done
+                        done < /tmp/issues.tsv
+                        wait
                     '''
                 }
             }
@@ -294,14 +340,21 @@ $(jq -r '.detail' /tmp/issue.json)" \
         always {
             script {
                 if (env.PR_HEAD_SHA) {
-                    def state = (env.REVIEW_VERDICT == 'PASS') ? 'success' : 'failure'
+                    // FIX: use pre-sanitized SAFE_VERDICT and COMMIT_STATE —
+                    // no AI-derived value ever reaches shell string interpolation
+                    def safeVerdict = env.SAFE_VERDICT ?: 'UNKNOWN'
+                    def commitState = env.COMMIT_STATE ?: 'error'
                     withCredentials([string(credentialsId: 'github-token', variable: 'TKN')]) {
                         sh """
-                            curl -sf -X POST \\
-                                 -H "Authorization: token \$TKN" \\
-                                 -H "Content-Type: application/json" \\
-                                 -d '{"state":"${state}","context":"claude-ai-review","description":"Multi-agent verdict: ${env.REVIEW_VERDICT}"}' \\
-                                 "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" || true
+                            jq -n \
+                                --arg state "${commitState}" \
+                                --arg desc  "Multi-agent verdict: ${safeVerdict}" \
+                                '{"state":\$state,"context":"claude-ai-review","description":\$desc}' \
+                            | curl -sf -X POST \
+                                   -H "Authorization: token \$TKN" \
+                                   -H "Content-Type: application/json" \
+                                   "https://api.github.com/repos/${env.REPO_PATH}/statuses/${env.PR_HEAD_SHA}" \
+                                   -d @- || true
                         """
                     }
                 }
@@ -311,8 +364,26 @@ $(jq -r '.detail' /tmp/issue.json)" \
     }
 }
 
-// ── Shared helper: runs one specialized agent and saves its raw findings ──────
-def runAgent(String agentClass, String mandate) {
+// ── Shared helper ─────────────────────────────────────────────────────────────
+// Runs one specialized agent and saves its raw findings to agent_<class>.json.
+//
+// Parameters:
+//   agentClass — one of: security, logic, style, performance, documentation
+//   mandate    — focused instruction string describing the agent's issue class
+//   diff       — pre-read contents of pr_diff.txt (avoids repeated disk reads)
+//   context    — pre-read contents of full_context.txt (avoids repeated disk reads)
+//
+// Preconditions:
+//   - env.CHANGED_FILES_LIST must be set
+//   - ANTHROPIC_API_KEY Jenkins credential must exist
+//
+// Side-effects (writes to workspace):
+//   - prompt_<agentClass>.txt   — the full prompt sent to Claude
+//   - raw_<agentClass>.json     — raw claude CLI output
+//   - agent_<agentClass>.json   — extracted JSON array of issues (may be [])
+//   - agent_<agentClass>_fallback.flag — created only if API failed and [] was used
+// ─────────────────────────────────────────────────────────────────────────────
+def runAgent(String agentClass, String mandate, String diff, String context) {
     def agentPrompt = """You are a specialized code review agent. Your mandate:
 
 ${mandate}
@@ -323,11 +394,13 @@ Be strict about false positives: only flag something if you are confident it is 
 CHANGED FILES: ${env.CHANGED_FILES_LIST}
 
 === GIT DIFF ===
-${readFile('pr_diff.txt')}
+${diff}
 
-${readFile('full_context.txt')}
+${context}
 
-Return ONLY a JSON array of issues (can be empty), no markdown fences:
+Return ONLY a JSON array of issues (can be empty). No explanation, no markdown fences.
+Start your response with [ and end with ].
+
 [
   {
     "file": "...",
@@ -344,9 +417,31 @@ Return ONLY a JSON array of issues (can be empty), no markdown fences:
         sh """
             export ANTHROPIC_API_KEY=\$CL_KEY
             claude -p "\$(cat prompt_${agentClass}.txt)" --output-format json > raw_${agentClass}.json 2>&1 || true
+
+            # Extract result and strip any fences
             jq -r '.result // "[]"' raw_${agentClass}.json \
-                | sed 's/^```json//; s/^```//; s/```\$//' > agent_${agentClass}.json
-            jq empty agent_${agentClass}.json || echo '[]' > agent_${agentClass}.json
+                | python3 -c "
+import sys, re
+text = sys.stdin.read()
+match = re.search(r'\\\`\\\`\\\`json\\\s*(\\\[.*?\\\])\\\s*\\\`\\\`\\\`', text, re.DOTALL)
+if match:
+    print(match.group(1))
+    sys.exit(0)
+start = text.find('[')
+end   = text.rfind(']')
+if start != -1 and end != -1:
+    print(text[start:end+1])
+    sys.exit(0)
+print('[]')
+" > agent_${agentClass}.json
+
+            # FIX: if JSON is invalid, write empty array AND set a fallback flag
+            # so the verification stage can detect a silently broken agent
+            if ! jq empty agent_${agentClass}.json 2>/dev/null; then
+                echo "WARNING: ${agentClass} agent returned invalid JSON — falling back to []"
+                echo '[]' > agent_${agentClass}.json
+                touch agent_${agentClass}_fallback.flag
+            fi
         """
     }
 }
